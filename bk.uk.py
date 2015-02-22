@@ -14,15 +14,37 @@
 # In HTML you will see:
 # <input type="hidden" name="PageList" id="PageList" value="##||add_ms_24686_fs001r||add_ms_24686_fs001v
 
+# Contatenate blocks into rows:
+# montage -mode concatenate -tile x1 `ls -1cr add_ms_24686_f044r_5_*` row_0.jpg
+#
+# for row in `seq 0 32`; do montage -mode concatenate -tile x1 `ls -1cr add_ms_24686_f044r_${row}_*` row_${row}.jpg; done
+#
+# Contatenate rows into page:
+# montage -mode concatenate -tile 1x `ls -1cr row_*` add_ms_24686_f044r.jpg
+
+from __future__ import print_function
+
+import os
+import re
 import sys
+import glob
 import urllib
+import shutil
 import argparse
 
 import requests
 from bs4 import BeautifulSoup
 
+from os.path import join as J
+from subprocess import call
+
+
 # col 22
 # row 32
+
+URL_PAGES = "http://www.bl.uk/manuscripts/Viewer.aspx?ref={manuscript}"
+URL_IMAGE_BLOCK = "http://www.bl.uk/manuscripts/Proxy.ashx?view={manuscript_and_page}_files/{resolution}/{column}_{row}.jpg"
+RESOLUTION = 14
 
 
 def download(save_folder):
@@ -42,7 +64,7 @@ def download(save_folder):
 
     # Start the download loop ...
     while (cur_page <= end_page):
-        print "Starting download..."
+        print("Starting download...")
 
         page = "f%s" % (str(cur_page).zfill(3))
 
@@ -57,26 +79,257 @@ def download(save_folder):
     for r in range(rows):
         for c in range(cols):
             try:
-                print "Saving arundel_ms_263_%s_files/%d/%d_%d.jpg" % (page, res, c, r)
+                print("Saving arundel_ms_263_%s_files/%d/%d_%d.jpg" % (page, res, c, r))
                 urllib.urlretrieve(
                     "http://www.bl.uk/manuscripts/Proxy.ashx?view=arundel_ms_263_%s_files/%d/%d_%d.jpg" % (page, res, c, r),
                     save_folder + "%s-%d-%d-%d.jpg" % (page, res, r, c) # Note: row and column are reversed. This made more sense to me.
                 )
             except KeyboardInterrupt:
-                print "Exiting..."
+                print("Exiting...")
                 return
 
-    print "Download finished!"
+    print("Download finished!")
+
+
+def mkpath(path):
+    '''
+    Make dir if it does not yet exist.
+    '''
+    if not os.path.exists(path):
+        try:
+            os.makedirs(path)
+        except OSError:
+            pass
+
+
+def put(string):
+    sys.stdout.write(string)
+    sys.stdout.flush()
+
+
+def get_pages(manuscript):
+    '''
+    Download manuscript page and extract the number of pages it contains.
+    '''
+    reply = requests.get(URL_PAGES.format(manuscript=manuscript))
+    soup = BeautifulSoup(reply.text)
+    str_pages = soup.find('input', {'id': 'PageList'}).attrs['value']
+    pages = str_pages.replace('##', '').split('||')
+    pages = list(filter(None, pages))
+    return pages
+
+
+def download_page(base_dir, manuscript, page):
+    '''
+    Download single page into base_dir/manuscript/page directory.
+    There will be a bunch of block files that you will need to contatenate
+    later.
+    '''
+    mkpath(J(base_dir, manuscript, page))
+
+    # First download image block that is out of range to see how such image
+    # looks like (this is used to detect edges later)
+    nil_block = requests.get(URL_IMAGE_BLOCK.format(manuscript_and_page=page,
+                                                    resolution=RESOLUTION,
+                                                    column=999, row=999))
+
+    column, row = 0, 0
+    max_column, max_row = 0, 0
+
+    while True:
+        filename = J(base_dir, manuscript, page,
+                     '{0}_{1}_{2}.jpg'.format(page, row, column))
+        # Do not download twice
+        if os.path.exists(filename):
+            max_row = max(row, max_row)
+            max_column = max(column, max_column)
+            column += 1
+            continue
+
+        #print('Getting block {0}x{1}'.format(row, column))
+        block = requests.get(URL_IMAGE_BLOCK.format(manuscript_and_page=page,
+                                                    resolution=RESOLUTION,
+                                                    column=column, row=row))
+
+        if block.content == nil_block.content:
+            put('\n')
+            # We are out of range
+            if column == 0:
+                # The end of the page
+                print('End of the page')
+                print('Page {0} has size row x column = {1} x {2}'.format(
+                    page, max_row, max_column))
+                break
+            else:
+                # The end of the row, reset column, increment row
+                column = 0
+                row += 1
+        else:
+            put('.')
+            # Note that I save in row-column order
+            with open(filename, 'wb') as output_file:
+                output_file.write(block.content)
+
+            # Update page size
+            max_row = max(row, max_row)
+            max_column = max(column, max_column)
+
+            # Go to next column
+            column += 1
+    return max_column, max_row
+
+
+def atoi(text):
+    return int(text) if text.isdigit() else text
+
+
+def natural_keys(text):
+    '''
+    Taken from:
+    http://stackoverflow.com/a/5967539/258421
+
+    alist.sort(key=natural_keys) sorts in human order
+    http://nedbatchelder.com/blog/200712/human_sorting.html
+    (See Toothy's implementation in the comments)
+    '''
+    return [atoi(c) for c in re.split('(\d+)', text)]
+
+
+def concatenate_page(base_dir, manuscript, page, columns, rows):
+    '''
+    Concatenate image blocks into a single page (still jpg).
+    '''
+    # How concat blocks into row looks in shell:
+    # montage -mode concatenate -tile x1 `ls -1cr add_ms_24686_f044r_5_*` row_0.jpg
+    for row in range(rows + 1):
+        row_filename = J(base_dir, manuscript, page, 'row_{0}.jpg'.format(row))
+        if os.path.exists(row_filename):
+            continue
+
+        glob_name = '{0}_{1}_*.jpg'.format(
+            J(base_dir, manuscript, page, page), row)
+        row_blocks = sorted(glob.glob(glob_name), key=natural_keys)
+        cmd = ('montage -mode concatenate -tile x1'.split() +
+               row_blocks + [row_filename])
+        call(cmd)
+        put('.')
+
+    # How concat rows into page looks in shell:
+    # montage -mode concatenate -tile 1x `ls -1cr row_*` add_ms_24686_f044r.jpg
+    page_filename = J(base_dir, manuscript, page) + '.jpg'
+    if os.path.exists(page_filename):
+        return
+
+    glob_name = '{0}_*.jpg'.format(J(base_dir, manuscript, page, 'row'))
+    rows = sorted(glob.glob(glob_name), key=natural_keys)
+    cmd = ('montage -mode concatenate -tile 1x'.split() +
+           rows + [page_filename])
+    call(cmd)
+    put('\n')
+
+
+def convert_pages(base_dir, manuscript, pages):
+    '''
+    Convert manuscript images into PDFs and join into single PDF.
+    '''
+    for i, page in enumerate(pages):
+        input_name = J(base_dir, manuscript, '{0}.jpg'.format(page))
+        output_name = J(base_dir, manuscript, '{0}.pdf'.format(page))
+        if os.path.exists(output_name):
+            continue
+        print('Converting page {0} ({1}/{2})'.format(page, i + 1, len(pages)))
+        cmd = ['convert', input_name, output_name]
+        call(cmd)
+
+
+def fold_pages(base_dir, manuscript, pages, output_name):
+    '''
+    Fold pdf pages into one by applying concat operation to a pair of docs.
+    '''
+    tmp_name = J(base_dir, manuscript + '.pdf.tmp')
+    pdfs = ['{0}.pdf'.format(page) for page in pages]
+    for i, pdf in enumerate(pdfs):
+        print('Folding page {0} ({1}/{2})'.format(pdf, i + 1, len(pages)))
+        pdf_name = J(base_dir, manuscript, pdf)
+        if os.path.exists(output_name):
+            cmd = ['pdftk', pdf_name, output_name, 'cat', 'output', tmp_name]
+            call(cmd)
+            os.unlink(output_name)
+            os.rename(tmp_name, output_name)
+        else:
+            shutil.copy2(pdf_name, output_name)
+
+
+def download_pages(base_dir, manuscript, pages):
+    '''
+    Download all pages of the manuscript.
+    '''
+    # Download pages
+    for i, page in enumerate(pages):
+        print('Downloading page {0} ({1}/{2})'.format(page, i + 1, len(pages)))
+        columns, rows = download_page(base_dir, manuscript, page)
+        #columns, rows = 32, 22
+
+        print('Concatenating page {0} ({1}/{2})'.format(page, i + 1, len(pages)))
+        concatenate_page(base_dir, manuscript, page, columns, rows)
+
+
+def convert_manuscript(base_dir, manuscript, pages):
+    '''
+    Convert manuscript and fold its pages into a single PDF.
+    '''
+    convert_pages(base_dir, manuscript, pages)
+    suffix = '-p{0}-r{1}.pdf'.format(len(pages), RESOLUTION)
+    output_name = J(base_dir, manuscript + suffix)
+    fold_pages(base_dir, manuscript, pages, output_name)
+
+
+def download_manuscript(base_dir, manuscript):
+    '''
+    Download whole manuscript. The result is a pdf file.
+    '''
+    print(manuscript)
+
+    # Get list of pages
+    pages = get_pages(manuscript)
+    print('{0} pages found'.format(len(pages)))
+    pages = [
+        "add_ms_24686_f043r",
+        "add_ms_24686_f043v",
+        "add_ms_24686_f044r",
+        "add_ms_24686_f044v",
+        "add_ms_24686_f045r",
+        "add_ms_24686_f045v",
+        "add_ms_24686_f046r",
+        "add_ms_24686_f046v",
+        "add_ms_24686_f047r"]
+
+    # Download all pages
+    download_pages(base_dir, manuscript, pages)
+
+    # Convert pages from jpg to pdf and join into single pdf
+    #pages = ['add_ms_24686_f044r', 'add_ms_24686_f044v']
+    print('Converting manuscript {0} into PDF'.format(manuscript))
+    convert_manuscript(base_dir, manuscript, pages)
+
+    # from ipdb import set_trace; set_trace()
+    print('done')
 
 
 def main(args):
-    print(args.names)
+    #print(args.names)
+    for name in args.names:
+        download_manuscript(args.base_dir, name)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='British Library manuscript downloader')
     parser.add_argument('names', type=str, nargs='+',
                         help='Names of the manuscript to download')
+    parser.add_argument('--base-dir', type=str, default='pics',
+                        help='Base directory')
+    parser.add_argument('--resolution', type=int, default=14,
+                        help='Resolution level (zoom, 14 is the highest)')
     args = parser.parse_args()
     sys.exit(main(args))
 
