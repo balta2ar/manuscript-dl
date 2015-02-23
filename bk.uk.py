@@ -44,7 +44,6 @@ from subprocess import call
 
 URL_PAGES = "http://www.bl.uk/manuscripts/Viewer.aspx?ref={manuscript}"
 URL_IMAGE_BLOCK = "http://www.bl.uk/manuscripts/Proxy.ashx?view={manuscript_and_page}_files/{resolution}/{column}_{row}.jpg"
-RESOLUTION = 14
 
 
 def download(save_folder):
@@ -119,7 +118,7 @@ def get_pages(manuscript):
     return pages
 
 
-def download_page(base_dir, manuscript, page):
+def download_page(resolution, base_dir, manuscript, page):
     '''
     Download single page into base_dir/manuscript/page directory.
     There will be a bunch of block files that you will need to contatenate
@@ -130,7 +129,7 @@ def download_page(base_dir, manuscript, page):
     # First download image block that is out of range to see how such image
     # looks like (this is used to detect edges later)
     nil_block = requests.get(URL_IMAGE_BLOCK.format(manuscript_and_page=page,
-                                                    resolution=RESOLUTION,
+                                                    resolution=resolution,
                                                     column=999, row=999))
 
     column, row = 0, 0
@@ -148,7 +147,7 @@ def download_page(base_dir, manuscript, page):
 
         #print('Getting block {0}x{1}'.format(row, column))
         block = requests.get(URL_IMAGE_BLOCK.format(manuscript_and_page=page,
-                                                    resolution=RESOLUTION,
+                                                    resolution=resolution,
                                                     column=column, row=row))
 
         if block.content == nil_block.content:
@@ -260,66 +259,63 @@ def fold_pages(base_dir, manuscript, pages, output_name):
             shutil.copy2(pdf_name, output_name)
 
 
-def download_pages(base_dir, manuscript, pages):
+def download_pages(resolution, base_dir, manuscript, pages):
     '''
     Download all pages of the manuscript.
     '''
     # Download pages
     for i, page in enumerate(pages):
         print('Downloading page {0} ({1}/{2})'.format(page, i + 1, len(pages)))
-        columns, rows = download_page(base_dir, manuscript, page)
-        #columns, rows = 32, 22
+        columns, rows = download_page(resolution, base_dir, manuscript, page)
 
         print('Concatenating page {0} ({1}/{2})'.format(page, i + 1, len(pages)))
         concatenate_page(base_dir, manuscript, page, columns, rows)
 
 
-def convert_manuscript(base_dir, manuscript, pages):
+def convert_manuscript(resolution, base_dir, manuscript, pages):
     '''
     Convert manuscript and fold its pages into a single PDF.
     '''
     convert_pages(base_dir, manuscript, pages)
-    suffix = '-p{0}-r{1}.pdf'.format(len(pages), RESOLUTION)
+    suffix = '-p{0}-r{1}.pdf'.format(len(pages), resolution)
     output_name = J(base_dir, manuscript + suffix)
     fold_pages(base_dir, manuscript, pages, output_name)
 
 
-def download_manuscript(base_dir, manuscript):
+def subset_pages(pages, pages_range):
+    a, b = pages_range.split(':')
+    a = int(a) if a else 0
+    b = int(b) + 1 if b else len(pages) + 1
+    return pages[a:b]
+
+
+def download_manuscript(pages_range, resolution, base_dir, manuscript):
     '''
     Download whole manuscript. The result is a pdf file.
     '''
-    print(manuscript)
+    print('Downloading manuscript {0} resolution {1}'
+          .format(manuscript, resolution))
 
     # Get list of pages
     pages = get_pages(manuscript)
     print('{0} pages found'.format(len(pages)))
-    pages = [
-        "add_ms_24686_f043r",
-        "add_ms_24686_f043v",
-        "add_ms_24686_f044r",
-        "add_ms_24686_f044v",
-        "add_ms_24686_f045r",
-        "add_ms_24686_f045v",
-        "add_ms_24686_f046r",
-        "add_ms_24686_f046v",
-        "add_ms_24686_f047r"]
+    pages = subset_pages(pages, pages_range)
+    print('{0} pages downloading (range {1})'.format(len(pages), pages_range))
 
     # Download all pages
-    download_pages(base_dir, manuscript, pages)
+    download_pages(resolution, base_dir, manuscript, pages)
 
     # Convert pages from jpg to pdf and join into single pdf
-    #pages = ['add_ms_24686_f044r', 'add_ms_24686_f044v']
     print('Converting manuscript {0} into PDF'.format(manuscript))
-    convert_manuscript(base_dir, manuscript, pages)
-
-    # from ipdb import set_trace; set_trace()
-    print('done')
+    convert_manuscript(resolution, base_dir, manuscript, pages)
 
 
 def main(args):
-    #print(args.names)
     for name in args.names:
-        download_manuscript(args.base_dir, name)
+        download_manuscript(args.pages,
+                            args.resolution,
+                            J(args.base_dir, str(args.resolution)),
+                            name)
 
 
 if __name__ == "__main__":
@@ -328,15 +324,9 @@ if __name__ == "__main__":
                         help='Names of the manuscript to download')
     parser.add_argument('--base-dir', type=str, default='pics',
                         help='Base directory')
-    parser.add_argument('--resolution', type=int, default=14,
+    parser.add_argument('--resolution', type=int, default=12,
                         help='Resolution level (zoom, 14 is the highest)')
+    parser.add_argument('--pages', type=str, default=':',
+                        help='Range of pages to download (both ends including)')
     args = parser.parse_args()
     sys.exit(main(args))
-
-    # Check if a save folder was specified in arguments
-    if len(sys.argv) > 1:
-        download(sys.argv[1])
-
-    # Otherwise save to the current directory
-    else:
-        download("")
