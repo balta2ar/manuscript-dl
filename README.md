@@ -21,6 +21,15 @@ $ e-codices.sh manifest.json [size]
 
 #### [British Library Digitised Manuscripts](http://www.bl.uk/manuscripts/)
 
+This downloader uses `pdftk` program to convert images to PDFs and concatenate
+them together. You need to have `pdftk` installed in your system.
+
+Ubuntu:
+
+``` bash
+sudo apt-get install pdftk
+```
+
 To download a book you need to find out its short name:
 
 1. Open manuscript description, e.g.: http://www.bl.uk/manuscripts/FullDisplay.aspx?ref=Add_MS_24686
