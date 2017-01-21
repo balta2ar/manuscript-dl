@@ -44,6 +44,7 @@ from subprocess import call
 
 URL_PAGES = "http://www.bl.uk/manuscripts/Viewer.aspx?ref={manuscript}"
 URL_IMAGE_BLOCK = "http://www.bl.uk/manuscripts/Proxy.ashx?view={manuscript_and_page}_files/{resolution}/{column}_{row}.jpg"
+INVALID_BLOCK_MAGIC_SUBSTRING = b'Parameter is not valid'
 
 
 def download(save_folder):
@@ -111,11 +112,25 @@ def get_pages(manuscript):
     Download manuscript page and extract the number of pages it contains.
     '''
     reply = requests.get(URL_PAGES.format(manuscript=manuscript))
-    soup = BeautifulSoup(reply.text)
+    soup = BeautifulSoup(reply.text, 'html.parser')
     str_pages = soup.find('input', {'id': 'PageList'}).attrs['value']
     pages = str_pages.replace('##', '').split('||')
     pages = list(filter(None, pages))
     return pages
+
+
+def is_valid_block(current_block, nil_block):
+    '''
+    Perform two tests to see whether this block is valid. They are not 100%
+    reliable, I believe.
+    '''
+    if INVALID_BLOCK_MAGIC_SUBSTRING in current_block.content:
+        return False
+
+    if len(current_block.content) <= len(nil_block.content):
+        return False
+
+    return True
 
 
 def download_page(resolution, base_dir, manuscript, page):
@@ -150,7 +165,7 @@ def download_page(resolution, base_dir, manuscript, page):
                                                     resolution=resolution,
                                                     column=column, row=row))
 
-        if block.content == nil_block.content:
+        if not is_valid_block(block, nil_block):
             put('\n')
             # We are out of range
             if column == 0:
