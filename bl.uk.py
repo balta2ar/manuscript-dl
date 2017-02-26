@@ -333,7 +333,7 @@ def fold_pages(base_dir, manuscript, pages, output_name):
         print('Folding page {0} ({1}/{2})'.format(pdf, i + 1, len(pages)))
         pdf_name = J(base_dir, manuscript, pdf)
         if os.path.exists(output_name):
-            cmd = ['pdftk', pdf_name, output_name, 'cat', 'output', tmp_name]
+            cmd = ['pdftk', output_name, pdf_name, 'cat', 'output', tmp_name]
             call(cmd)
             os.unlink(output_name)
             os.rename(tmp_name, output_name)
