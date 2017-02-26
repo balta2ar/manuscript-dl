@@ -27,16 +27,19 @@ from __future__ import print_function
 import os
 import re
 import sys
+import time
 import glob
 import urllib
 import shutil
+import imghdr
 import argparse
-
-import requests
-from bs4 import BeautifulSoup
+import random
 
 from os.path import join as J
 from subprocess import call
+
+import requests
+from bs4 import BeautifulSoup
 
 
 # col 22
@@ -45,6 +48,7 @@ from subprocess import call
 URL_PAGES = "http://www.bl.uk/manuscripts/Viewer.aspx?ref={manuscript}"
 URL_IMAGE_BLOCK = "http://www.bl.uk/manuscripts/Proxy.ashx?view={manuscript_and_page}_files/{resolution}/{column}_{row}.jpg"
 INVALID_BLOCK_MAGIC_SUBSTRING = b'Parameter is not valid'
+MAX_BLOCK_DOWNLOAD_RETRIES = 6
 
 
 def download(save_folder):
@@ -133,6 +137,66 @@ def is_valid_block(current_block, nil_block):
     return True
 
 
+def is_valid_image(filename):
+    '''
+    Valid image is an image that can be parsed as a JPEG file.
+    '''
+    if not os.path.exists(filename):
+        return False
+
+    return imghdr.what(filename) == 'jpeg'
+
+
+class BlockResult(Exception):
+    pass
+
+class BlockAlreadyDownloaded(BlockResult):
+    pass
+
+class BlockInvalid(BlockResult):
+    pass
+
+class BlockMaxRetriesReached(BlockResult):
+    pass
+
+
+def download_block(url, filename, nil_block):
+    '''
+    Download single page block (rectangular). This method will retry up to
+    MAX_BLOCK_DOWNLOAD_RETRIES times if downloaded image is not JPEG.
+    Delays between retries are choosen according to the binary exponential
+    backoff strategy.
+    '''
+    for i in range(MAX_BLOCK_DOWNLOAD_RETRIES):
+        # Do not download twice
+        if is_valid_image(filename):
+            raise BlockAlreadyDownloaded()
+
+        block = requests.get(url)
+        if not is_valid_block(block, nil_block):
+            raise BlockInvalid()
+
+        # Note that I save in row-column order
+        with open(filename, 'wb') as output_file:
+            output_file.write(block.content)
+
+        # Retry if not a valid image
+        if not is_valid_image(filename):
+            # Skip sleeping if this is the last attempt
+            if i != MAX_BLOCK_DOWNLOAD_RETRIES - 1:
+                sleep_duration = random.randint(1, 2**i)
+                # print('Failed to download block %s, will sleep for %s and retry' % \
+                #       (url, sleep_duration))
+                time.sleep(sleep_duration)
+            continue
+
+        return None
+
+    # print('Failed to download page block %s after %s retries' % \
+    #       (url, MAX_BLOCK_DOWNLOAD_RETRIES))
+    raise BlockMaxRetriesReached()
+
+
 def download_page(resolution, base_dir, manuscript, page):
     '''
     Download single page into base_dir/manuscript/page directory.
@@ -153,19 +217,21 @@ def download_page(resolution, base_dir, manuscript, page):
     while True:
         filename = J(base_dir, manuscript, page,
                      '{0}_{1}_{2}.jpg'.format(page, row, column))
-        # Do not download twice
-        if os.path.exists(filename):
+
+        #print('Getting block {0}x{1}'.format(row, column))
+        url = URL_IMAGE_BLOCK.format(manuscript_and_page=page,
+                                     resolution=resolution,
+                                     column=column, row=row)
+
+        try:
+            download_block(url, filename, nil_block)
+        except BlockAlreadyDownloaded:
             max_row = max(row, max_row)
             max_column = max(column, max_column)
             column += 1
+            put('.')
             continue
-
-        #print('Getting block {0}x{1}'.format(row, column))
-        block = requests.get(URL_IMAGE_BLOCK.format(manuscript_and_page=page,
-                                                    resolution=resolution,
-                                                    column=column, row=row))
-
-        if not is_valid_block(block, nil_block):
+        except BlockInvalid:
             put('\n')
             # We are out of range
             if column == 0:
@@ -178,18 +244,19 @@ def download_page(resolution, base_dir, manuscript, page):
                 # The end of the row, reset column, increment row
                 column = 0
                 row += 1
+                continue
+        except BlockMaxRetriesReached:
+            put('X')
         else:
             put('.')
-            # Note that I save in row-column order
-            with open(filename, 'wb') as output_file:
-                output_file.write(block.content)
 
-            # Update page size
-            max_row = max(row, max_row)
-            max_column = max(column, max_column)
+        # Update page size
+        max_row = max(row, max_row)
+        max_column = max(column, max_column)
 
-            # Go to next column
-            column += 1
+        # Go to next column
+        column += 1
+
     return max_column, max_row
 
 
