@@ -49,6 +49,10 @@ URL_PAGES = "http://www.bl.uk/manuscripts/Viewer.aspx?ref={manuscript}"
 URL_IMAGE_BLOCK = "http://www.bl.uk/manuscripts/Proxy.ashx?view={manuscript_and_page}_files/{resolution}/{column}_{row}.jpg"
 INVALID_BLOCK_MAGIC_SUBSTRING = b'Parameter is not valid'
 MAX_BLOCK_DOWNLOAD_RETRIES = 6
+USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.181 Safari/537.36'
+
+
+_session = requests.Session()
 
 
 def download(save_folder):
@@ -115,7 +119,7 @@ def get_pages(manuscript):
     '''
     Download manuscript page and extract the number of pages it contains.
     '''
-    reply = requests.get(URL_PAGES.format(manuscript=manuscript))
+    reply = _session.get(URL_PAGES.format(manuscript=manuscript))
     soup = BeautifulSoup(reply.text, 'html.parser')
     str_pages = soup.find('input', {'id': 'PageList'}).attrs['value']
     pages = str_pages.replace('##', '').split('||')
@@ -172,7 +176,7 @@ def download_block(url, filename, nil_block):
         if is_valid_image(filename):
             raise BlockAlreadyDownloaded()
 
-        block = requests.get(url)
+        block = _session.get(url)
         if not is_valid_block(block, nil_block):
             raise BlockInvalid()
 
@@ -207,7 +211,7 @@ def download_page(resolution, base_dir, manuscript, page):
 
     # First download image block that is out of range to see how such image
     # looks like (this is used to detect edges later)
-    nil_block = requests.get(URL_IMAGE_BLOCK.format(manuscript_and_page=page,
+    nil_block = _session.get(URL_IMAGE_BLOCK.format(manuscript_and_page=page,
                                                     resolution=resolution,
                                                     column=999, row=999))
 
@@ -410,5 +414,10 @@ if __name__ == "__main__":
                         help='Resolution level (zoom, 14 is the highest)')
     parser.add_argument('--pages', type=str, default=':',
                         help='Range of pages to download (both ends including)')
+    parser.add_argument('--user-agent', type=str, default=USER_AGENT,
+                        help='Fake user agent')
     args = parser.parse_args()
+
+    _session.headers.update({'User-Agent': args.user_agent})
+
     sys.exit(main(args))

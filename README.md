@@ -39,11 +39,19 @@ To download a book you need to find out its short name:
 4. Run the `bl.uk.py` with manuscript name:
 
 ``` bash
-$ python2 bl.uk.py add_ms_24686 --resolution 12
+$ python3 bl.uk.py add_ms_24686 --resolution 12
 ```
 
 This will grab all available pages with resolution 12. If you want specific pages, you can set page range using `--pages A:B` argument.
 
+At some point the Library started replying with HTTP 429 (Too Many Requests).
+Faking user agent helped. If default user agent is not working for you, you can
+replace it using `--user-agent` option like this:
+
+``` bash
+python3 bl.uk.py add_ms_24686 --user-agent 'Mozilla/5.0 (X11; OpenBSD i386) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/36.0.1985.125 Safari/537.36'
+```
+
 ### Author
 
-(c) 2015 Yuri Bochkarev
+(c) 2015-2018 Yuri Bochkarev
