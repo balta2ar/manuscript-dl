@@ -204,7 +204,7 @@ def download_block(url, filename, nil_block):
 def download_page(resolution, base_dir, manuscript, page):
     '''
     Download single page into base_dir/manuscript/page directory.
-    There will be a bunch of block files that you will need to contatenate
+    There will be a bunch of block files that you will need to concatenate
     later.
     '''
     mkpath(J(base_dir, manuscript, page))
