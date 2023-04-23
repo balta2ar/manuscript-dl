@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import re
 import argparse
 import logging
 import logging.handlers
@@ -16,7 +17,7 @@ from urllib.request import Request, urlopen
 
 from diskcache import Cache
 from PIL import Image
-from plumbum import local
+from plumbum import local, FG
 
 USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.99 Safari/537.36'
 FORMAT = '%(asctime)-15s %(levelname)s %(message)s'
@@ -59,13 +60,17 @@ def spit(data, filename):
     with open(ensure_dir(filename), 'w') as f:
         f.write(data)
 
+def fs_friendly(path):
+    # return re.sub(r'[^a-zA-Z0-9_\-\.]', '_', path)
+    return path.replace('/', '_').replace(':', '_')
+
 class Book:
     #  https://www.nb.no/services/image/resolver/URN:NBN:no-nb_digibok_2008091504048_0025/0,0,1024,1024/1024,/0/default.jpg
     def __init__(self, id: str):
         self.id = id
-        self.dir = join('nb.no', id.replace(':', '_'))
-        self.manifest = get_manifest(self.id)
-        self.label = self.manifest['label']
+        self.manifest = get_manifest(id)
+        self.label = fs_friendly(self.manifest['label'])
+        self.dir = join('nb.no', fs_friendly(id) + '-' + self.label)
 
     def get_page(self, page: Page):
         filename = join(self.dir, '{:04d}_{}.png'.format(page.index, page.id))
@@ -82,10 +87,10 @@ class Book:
             cx = 0
             cy += page.tile.height
         img.save(ensure_dir(filename))
+        logging.info('saved %s', filename)
 
     def download(self):
         spit(dumps(self.manifest, indent=4), join(self.dir, 'manifest.json'))
-        print('saved')
 
         tasks = []
         index = 0
@@ -129,7 +134,7 @@ class Book:
         script = dedent(script).strip()
         spit(script, join(self.dir, 'convert.sh'))
         with local.cwd(self.dir):
-            bash['./convert.sh']()
+            bash['./convert.sh'] & FG
         
         # print(f'cd "{self.dir}"')
         # print('parallel --bar convert "{}" "{.}.pdf" ::: *.png')
