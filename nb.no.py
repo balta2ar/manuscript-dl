@@ -6,19 +6,30 @@ import logging.handlers
 from collections import namedtuple
 from io import BytesIO
 from json import dumps, loads
+from multiprocessing.pool import ThreadPool
 from os import makedirs
 from os.path import dirname, exists, join
+from shutil import which
 from tempfile import gettempdir
+from textwrap import dedent
 from urllib.request import Request, urlopen
 
 from diskcache import Cache
 from PIL import Image
+from plumbum import local
 
 USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.99 Safari/537.36'
 FORMAT = '%(asctime)-15s %(levelname)s %(message)s'
 logging.basicConfig(format=FORMAT, level=logging.DEBUG)
 
+bash = local['bash']
 cache = Cache(join(gettempdir(), 'manuscript-dl', 'nb.no'))
+
+def must_bin(name):
+    where = which(name)
+    if not where:
+        raise Exception('Missing {}'.format(name))
+    return where
 
 @cache.memoize()
 def http_get_sync(url):
@@ -36,7 +47,7 @@ def get_manifest(id):
     return loads(data)
 
 Shape = namedtuple('Shape', ['width', 'height'])
-Page = namedtuple('Page', ['id', 'url', 'index', 'shape'])
+Page = namedtuple('Page', ['id', 'url', 'index', 'shape', 'tile'])
 
 def ensure_dir(filename):
     dir = dirname(filename)
@@ -50,32 +61,35 @@ def spit(data, filename):
 
 class Book:
     #  https://www.nb.no/services/image/resolver/URN:NBN:no-nb_digibok_2008091504048_0025/0,0,1024,1024/1024,/0/default.jpg
-    def __init__(self, id):
+    def __init__(self, id: str):
         self.id = id
         self.dir = join('nb.no', id.replace(':', '_'))
+        self.manifest = get_manifest(self.id)
+        self.label = self.manifest['label']
 
-    def get_page(self, page, tile):
+    def get_page(self, page: Page):
         filename = join(self.dir, '{:04d}_{}.png'.format(page.index, page.id))
         if exists(filename): return
         cx, cy = 0, 0
         img = Image.new('RGB', (page.shape.width, page.shape.height))
         while cy < page.shape.height:
             while cx < page.shape.width:
-                tile_url = page.url + '/{},{},{},{}/{},/0/default.jpg'.format(cx, cy, tile.width, tile.height, tile.width)
+                tile_url = page.url + '/{},{},{},{}/{},/0/default.jpg'.format(
+                    cx, cy, page.tile.width, page.tile.height, page.tile.width)
                 data = http_get_sync(tile_url)
                 img.paste(Image.open(BytesIO(data)), (cx, cy))
-                cx += tile.width
+                cx += page.tile.width
             cx = 0
-            cy += tile.height
+            cy += page.tile.height
         img.save(ensure_dir(filename))
 
     def download(self):
-        manifest = get_manifest(self.id)
-        spit(dumps(manifest, indent=4), join(self.dir, 'manifest.json'))
+        spit(dumps(self.manifest, indent=4), join(self.dir, 'manifest.json'))
         print('saved')
 
+        tasks = []
         index = 0
-        for sequence in manifest['sequences']:
+        for sequence in self.manifest['sequences']:
             for canvas in sequence['canvases']:
                 for image in canvas['images']:
                     service = image['resource']['service']
@@ -85,17 +99,44 @@ class Book:
                     # tile = Block(size['width'], size['height'])
                     tile_shape = Shape(1024, 1024)
                     page_shape = Shape(service['width'], service['height'])
-                    page = Page(id, url, index, page_shape)
-                    self.get_page(page, tile_shape)
+                    page = Page(id, url, index, page_shape, tile_shape)
+                    # self.get_page(page)
+                    tasks.append(page)
                     index += 1
-        filename = manifest['label'] + '.pdf'
+
+        with ThreadPool(5) as pool:
+            for _ in pool.imap(self.get_page, tasks): pass
+    
+    def convert(self):
+        must_bin('bash')
+        must_bin('convert')
+        must_bin('pdftk')
+        must_bin('ocrmypdf')
+        must_bin('parallel')
+
+        filename = self.label + '.pdf'
         #cmd = 'convert -density 300 -quality 100 {}/????_*.png {}'.format(self.dir, filename)
-        print(f'cd "{self.dir}"')
-        print('parallel --bar convert "{}" "{.}.pdf" ::: *.png')
-        # print('pdfunite *.pdf out.pdf')
-        print('pdftk *.pdf cat output out.pdf')
-        #print('convert -density 300 -quality 100 *.png out.pdf')
-        print(f'ocrmypdf -l nor --jobs 12 --output-type pdfa out.pdf "{filename}"')
+        script = f'''
+        #!/bin/bash
+        set -e
+        set -x
+        mkdir -p pdf
+        mkdir -p out
+        parallel --bar convert "{{}}" pdf/"{{.}}.pdf" ::: *.png
+        pdftk pdf/*.pdf cat output out/out.pdf
+        ocrmypdf -l nor --jobs 12 --output-type pdfa out/out.pdf "../../{filename}"
+'''
+        script = dedent(script).strip()
+        spit(script, join(self.dir, 'convert.sh'))
+        with local.cwd(self.dir):
+            bash['./convert.sh']()
+        
+        # print(f'cd "{self.dir}"')
+        # print('parallel --bar convert "{}" "{.}.pdf" ::: *.png')
+        # # print('pdfunite *.pdf out.pdf')
+        # print('pdftk *.pdf cat output out.pdf')
+        # #print('convert -density 300 -quality 100 *.png out.pdf')
+        # print(f'ocrmypdf -l nor --jobs 12 --output-type pdfa out.pdf "{filename}"')
         
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Download books from nb.no')
@@ -104,3 +145,4 @@ if __name__ == '__main__':
 
     book = Book(args.id)
     book.download()
+    book.convert()
