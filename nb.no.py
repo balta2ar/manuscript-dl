@@ -1,19 +1,18 @@
 #!/usr/bin/env python
 
-from os import makedirs
-from io import BytesIO
 import argparse
-from json import loads
-from collections import namedtuple
-from os.path import join, exists, dirname
-from tempfile import gettempdir
-
 import logging
 import logging.handlers
+from collections import namedtuple
+from io import BytesIO
+from json import dumps, loads
+from os import makedirs
+from os.path import dirname, exists, join
+from tempfile import gettempdir
+from urllib.request import Request, urlopen
 
-from urllib.request import urlopen, Request
-from PIL import Image
 from diskcache import Cache
+from PIL import Image
 
 USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.99 Safari/537.36'
 FORMAT = '%(asctime)-15s %(levelname)s %(message)s'
@@ -45,6 +44,10 @@ def ensure_dir(filename):
         makedirs(dir)
     return filename
 
+def spit(data, filename):
+    with open(ensure_dir(filename), 'w') as f:
+        f.write(data)
+
 class Book:
     #  https://www.nb.no/services/image/resolver/URN:NBN:no-nb_digibok_2008091504048_0025/0,0,1024,1024/1024,/0/default.jpg
     def __init__(self, id):
@@ -68,6 +71,8 @@ class Book:
 
     def download(self):
         manifest = get_manifest(self.id)
+        spit(dumps(manifest, indent=4), join(self.dir, 'manifest.json'))
+        print('saved')
 
         index = 0
         for sequence in manifest['sequences']:
@@ -85,8 +90,12 @@ class Book:
                     index += 1
         filename = manifest['label'] + '.pdf'
         #cmd = 'convert -density 300 -quality 100 {}/????_*.png {}'.format(self.dir, filename)
-        print(f'convert -density 300 -quality 100 {self.dir}/*.png out.pdf')
-        print(f'ocrmypdf -l nor --jobs 12 --output-type pdfa "{filename}" out.pdf')
+        print(f'cd "{self.dir}"')
+        print('parallel --bar convert "{}" "{.}.pdf" ::: *.png')
+        # print('pdfunite *.pdf out.pdf')
+        print('pdftk *.pdf cat output out.pdf')
+        #print('convert -density 300 -quality 100 *.png out.pdf')
+        print(f'ocrmypdf -l nor --jobs 12 --output-type pdfa out.pdf "{filename}"')
         
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Download books from nb.no')
