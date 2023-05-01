@@ -5,6 +5,16 @@ Some online libraries provide convenient way to download complete manuscript as 
 
 ### Supported libraries
 
+#### [Nasjonalbiblioteket](https://www.nb.no/)
+
+To download a book:
+
+1. Find out its ID, e.g.: https://www.nb.no/items/URN:NBN:no-nb_digibok_2008091504048?page=1
+2. Run:
+```bash
+$ python ./nb.no.py URN:NBN:no-nb_digibok_2008091504048
+```
+
 #### [e-codices - Virtual Manuscript Library of Switzerland](http://www.e-codices.unifr.ch/en)
 
 To download a book:

@@ -127,7 +127,8 @@ class Book:
         set -x
         mkdir -p pdf
         mkdir -p out
-        parallel --bar convert "{{}}" pdf/"{{.}}.pdf" ::: *.png
+        #parallel --bar convert "{{}}" "pdf/{{.}}.pdf" ::: *.png
+        parallel --bar convert -resize "50%" "{{}}" "pdf/{{.}}.pdf" ::: *.png
         pdftk pdf/*.pdf cat output out/out.pdf
         ocrmypdf -l nor --jobs 12 --output-type pdfa out/out.pdf "../../{filename}"
 '''
