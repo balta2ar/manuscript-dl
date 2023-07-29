@@ -10,9 +10,10 @@ Some online libraries provide convenient way to download complete manuscript as 
 To download a book:
 
 1. Find out its ID, e.g.: https://www.nb.no/items/URN:NBN:no-nb_digibok_2008091504048?page=1
-2. Run:
+2. (optional) Copy curl command from the browser, so that you preserve cookies, and adjust it.
+3. Run:
 ```bash
-$ python ./nb.no.py URN:NBN:no-nb_digibok_2008091504048
+$ python ./nb.no.py -H 'cookie: something' URN:NBN:no-nb_digibok_2008091504048
 ```
 
 #### [e-codices - Virtual Manuscript Library of Switzerland](http://www.e-codices.unifr.ch/en)

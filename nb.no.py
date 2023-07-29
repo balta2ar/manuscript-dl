@@ -33,18 +33,21 @@ def must_bin(name):
     return where
 
 @cache.memoize()
-def http_get_sync(url):
+def http_get_sync(url, headers=None):
     req = Request(url)
     req.add_header('User-Agent', USER_AGENT)
     req.add_header('Accept', '*/*')
+    if headers:
+        for k, v in headers.items():
+            req.add_header(k, v)
     logging.info('sync HTTP GET %s', url)
     with urlopen(req) as resp:
         return resp.read()
 
-def get_manifest(id):
+def get_manifest(id, downloader):
     # https://api.nb.no/catalog/v1/iiif/URN:NBN:no-nb_digibok_2008091504048/manifest?profile=nbdigital
     url = 'https://api.nb.no/catalog/v1/iiif/{}/manifest?profile=nbdigital'.format(id)
-    data = http_get_sync(url)
+    data = downloader(url)
     return loads(data)
 
 Shape = namedtuple('Shape', ['width', 'height'])
@@ -66,9 +69,10 @@ def fs_friendly(path):
 
 class Book:
     #  https://www.nb.no/services/image/resolver/URN:NBN:no-nb_digibok_2008091504048_0025/0,0,1024,1024/1024,/0/default.jpg
-    def __init__(self, id: str):
+    def __init__(self, id: str, downloader):
+        self.downloader = downloader
         self.id = id
-        self.manifest = get_manifest(id)
+        self.manifest = get_manifest(id, downloader)
         self.label = fs_friendly(self.manifest['label'])
         self.dir = join('nb.no', fs_friendly(id) + '-' + self.label)
 
@@ -81,7 +85,7 @@ class Book:
             while cx < page.shape.width:
                 tile_url = page.url + '/{},{},{},{}/{},/0/default.jpg'.format(
                     cx, cy, page.tile.width, page.tile.height, page.tile.width)
-                data = http_get_sync(tile_url)
+                data = self.downloader(tile_url)
                 img.paste(Image.open(BytesIO(data)), (cx, cy))
                 cx += page.tile.width
             cx = 0
@@ -143,12 +147,25 @@ class Book:
         # print('pdftk *.pdf cat output out.pdf')
         # #print('convert -density 300 -quality 100 *.png out.pdf')
         # print(f'ocrmypdf -l nor --jobs 12 --output-type pdfa out.pdf "{filename}"')
-        
-if __name__ == '__main__':
+
+def main():
+    # python ./nb.no.py -H 'header: value' URN:NBN:no-nb_digibok_2008091504048
     parser = argparse.ArgumentParser('Download books from nb.no')
     parser.add_argument('id', help='Book ID')
+    parser.add_argument('-H', '--header', help='HTTP header', action='append')
     args = parser.parse_args()
+    print(args)
 
-    book = Book(args.id)
+    def downloader(url):
+        headers = {}
+        for h in args.header:
+            k, v = h.split(':', 1)
+            headers[k.strip()] = v.strip()
+        return http_get_sync(url, headers)
+
+    book = Book(args.id, downloader)
     book.download()
     book.convert()
+
+if __name__ == '__main__':
+    main()
