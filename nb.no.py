@@ -14,12 +14,13 @@ from shutil import which
 from tempfile import gettempdir
 from textwrap import dedent
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 from diskcache import Cache
 from PIL import Image
 from plumbum import local, FG
 
-USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.99 Safari/537.36'
+USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
 FORMAT = '%(asctime)-15s %(levelname)s %(message)s'
 logging.basicConfig(format=FORMAT, level=logging.DEBUG)
 
@@ -41,8 +42,17 @@ def http_get_sync(url, headers=None):
         for k, v in headers.items():
             req.add_header(k, v)
     logging.info('sync HTTP GET %s', url)
-    with urlopen(req) as resp:
-        return resp.read()
+    try:
+        with urlopen(req) as resp:
+            return resp.read()
+    except HTTPError as e:
+        logging.error('ERROR HTTP GET %s %s', url, e)
+        return None
+        #raise
+
+def suffix(s, suffix):
+    if s.endswith(suffix): return s
+    return s + suffix
 
 def get_manifest(id, downloader):
     # https://api.nb.no/catalog/v1/iiif/URN:NBN:no-nb_digibok_2008091504048/manifest?profile=nbdigital
@@ -51,6 +61,7 @@ def get_manifest(id, downloader):
     return loads(data)
 
 Shape = namedtuple('Shape', ['width', 'height'])
+Tile = namedtuple('Tile', ['width', 'scale'])
 Page = namedtuple('Page', ['id', 'url', 'index', 'shape', 'tile'])
 
 def ensure_dir(filename):
@@ -82,14 +93,21 @@ class Book:
         cx, cy = 0, 0
         img = Image.new('RGB', (page.shape.width, page.shape.height))
         while cy < page.shape.height:
+            #tw, th = page.tile.width, page.tile.height
             while cx < page.shape.width:
                 tile_url = page.url + '/{},{},{},{}/{},/0/default.jpg'.format(
                     cx, cy, page.tile.width, page.tile.height, page.tile.width)
                 data = self.downloader(tile_url)
-                img.paste(Image.open(BytesIO(data)), (cx, cy))
+                if data is not None:
+                    tile = Image.open(BytesIO(data))
+                    #tw, th = tile.size
+                    #print('TILE size', tile.size)
+                    img.paste(tile, (cx, cy))
                 cx += page.tile.width
+                #cx += tw
             cx = 0
             cy += page.tile.height
+            #cy += th
         img.save(ensure_dir(filename))
         logging.info('saved %s', filename)
 
@@ -104,26 +122,28 @@ class Book:
                     service = image['resource']['service']
                     url = service['@id']
                     id = url.split('_')[-1]
-                    # size = max(service['sizes'], key=lambda x: x['width'])
-                    # tile = Block(size['width'], size['height'])
+                    #size = max(service['sizes'], key=lambda x: x['width'])
+                    #tile_shape = Shape(size['width'], size['height'])
+                    #tile_shape = Shape(2048, 2048)
                     tile_shape = Shape(1024, 1024)
+                    #tile_shape = Shape(512, 512)
                     page_shape = Shape(service['width'], service['height'])
                     page = Page(id, url, index, page_shape, tile_shape)
                     # self.get_page(page)
                     tasks.append(page)
                     index += 1
 
-        with ThreadPool(5) as pool:
+        with ThreadPool(1) as pool:
             for _ in pool.imap(self.get_page, tasks): pass
-    
-    def convert(self):
+
+    def convert(self, filename):
         must_bin('bash')
         must_bin('convert')
         must_bin('pdftk')
         must_bin('ocrmypdf')
         must_bin('parallel')
 
-        filename = self.label + '.pdf'
+        filename = suffix(filename or self.label, '.pdf')
         #cmd = 'convert -density 300 -quality 100 {}/????_*.png {}'.format(self.dir, filename)
         script = f'''
         #!/bin/bash
@@ -132,15 +152,16 @@ class Book:
         mkdir -p pdf
         mkdir -p out
         #parallel --bar convert "{{}}" "pdf/{{.}}.pdf" ::: *.png
-        parallel --bar convert -resize "50%" "{{}}" "pdf/{{.}}.pdf" ::: *.png
+        #parallel --jobs 1 --bar convert -resize "50%" "{{}}" "pdf/{{.}}.pdf" ::: *.png
+        parallel --jobs 6 --bar gm convert -resize "50%" "{{}}" "pdf/{{.}}.pdf" ::: *.png
         pdftk pdf/*.pdf cat output out/out.pdf
-        ocrmypdf -l nor --jobs 12 --output-type pdfa out/out.pdf "../../{filename}"
+        ocrmypdf -l nor --jobs 6 --output-type pdfa out/out.pdf "../../{filename}"
 '''
         script = dedent(script).strip()
         spit(script, join(self.dir, 'convert.sh'))
         with local.cwd(self.dir):
             bash['./convert.sh'] & FG
-        
+
         # print(f'cd "{self.dir}"')
         # print('parallel --bar convert "{}" "{.}.pdf" ::: *.png')
         # # print('pdfunite *.pdf out.pdf')
@@ -152,6 +173,7 @@ def main():
     # python ./nb.no.py -H 'header: value' URN:NBN:no-nb_digibok_2008091504048
     parser = argparse.ArgumentParser('Download books from nb.no')
     parser.add_argument('id', help='Book ID')
+    parser.add_argument('filename', nargs='?', default=None, help='Output filename')
     parser.add_argument('-H', '--header', help='HTTP header', action='append')
     args = parser.parse_args()
     print(args)
@@ -165,7 +187,7 @@ def main():
 
     book = Book(args.id, downloader)
     book.download()
-    book.convert()
+    book.convert(args.filename)
 
 if __name__ == '__main__':
     main()
