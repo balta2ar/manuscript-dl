@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import re
 import argparse
@@ -137,12 +137,6 @@ class Book:
             for _ in pool.imap(self.get_page, tasks): pass
 
     def convert(self, filename):
-        must_bin('bash')
-        must_bin('convert')
-        must_bin('pdftk')
-        must_bin('ocrmypdf')
-        must_bin('parallel')
-
         filename = suffix(filename or self.label, '.pdf')
         #cmd = 'convert -density 300 -quality 100 {}/????_*.png {}'.format(self.dir, filename)
         script = f'''
@@ -170,6 +164,13 @@ class Book:
         # print(f'ocrmypdf -l nor --jobs 12 --output-type pdfa out.pdf "{filename}"')
 
 def main():
+    must_bin('bash')
+    must_bin('convert')
+    must_bin('pdftk')
+    must_bin('ocrmypdf')
+    must_bin('parallel')
+    must_bin('gm')
+
     # python ./nb.no.py -H 'header: value' URN:NBN:no-nb_digibok_2008091504048
     parser = argparse.ArgumentParser('Download books from nb.no')
     parser.add_argument('id', help='Book ID')
