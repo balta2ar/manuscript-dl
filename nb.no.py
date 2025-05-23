@@ -4,6 +4,7 @@ import argparse
 import logging
 import logging.handlers
 import re
+import time
 from collections import namedtuple
 from io import BytesIO
 from json import dumps, loads
@@ -41,14 +42,22 @@ def http_get_sync(url, headers=None):
     if headers:
         for k, v in headers.items():
             req.add_header(k, v)
-    logging.info('sync HTTP GET %s', url)
-    try:
-        with urlopen(req) as resp:
-            return resp.read()
-    except HTTPError as e:
-        logging.error('ERROR HTTP GET %s %s', url, e)
-        return None
-        #raise
+
+    max_retries = 10
+    for retry in range(max_retries):
+        try:
+            logging.info('sync HTTP GET %s (attempt %d/%d)', url, retry + 1, max_retries)
+            with urlopen(req) as resp:
+                return resp.read()
+        except HTTPError as e:
+            logging.error('ERROR HTTP GET %s %s', url, e)
+            if retry == max_retries - 1:  # If this was the last retry
+                return None
+            sleep_time = retry + 1  # Increasing timeout: 1, 2, ..., 10s
+            logging.info('Retrying in %d seconds...', sleep_time)
+            time.sleep(sleep_time)
+
+    return None  # This should never be reached, but added for clarity
 
 def suffix(s, suffix):
     if s.endswith(suffix): return s
