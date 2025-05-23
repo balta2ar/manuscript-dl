@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-import re
 import argparse
 import logging
 import logging.handlers
+import re
 from collections import namedtuple
 from io import BytesIO
 from json import dumps, loads
@@ -13,12 +13,12 @@ from os.path import dirname, exists, join
 from shutil import which
 from tempfile import gettempdir
 from textwrap import dedent
-from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from diskcache import Cache
 from PIL import Image
-from plumbum import local, FG
+from plumbum import FG, local
 
 USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
 FORMAT = '%(asctime)-15s %(levelname)s %(message)s'
