@@ -49,7 +49,7 @@ def http_get_sync(url, headers=None):
             logging.info('sync HTTP GET %s (attempt %d/%d)', url, retry + 1, max_retries)
             with urlopen(req) as resp:
                 return resp.read()
-        except HTTPError as e:
+        except Exception as e:
             logging.error('ERROR HTTP GET %s %s', url, e)
             if retry == max_retries - 1:  # If this was the last retry
                 return None
