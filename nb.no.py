@@ -55,7 +55,7 @@ def http_get_sync(url, headers=None):
                 return None
             sleep_time = retry + 1  # Increasing timeout: 1, 2, ..., 10s
             logging.info('Retrying in %d seconds...', sleep_time)
-            time.sleep(sleep_time)
+            time.sleep(3*sleep_time)
 
     return None  # This should never be reached, but added for clarity
 
