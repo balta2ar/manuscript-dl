@@ -10,7 +10,7 @@ from io import BytesIO
 from json import dumps, loads
 from multiprocessing.pool import ThreadPool
 from os import makedirs
-from os.path import dirname, exists, join
+from os.path import dirname, exists, join, isfile
 from shutil import which
 from tempfile import gettempdir
 from textwrap import dedent
@@ -82,6 +82,10 @@ def ensure_dir(filename):
 def spit(data, filename):
     with open(ensure_dir(filename), 'w') as f:
         f.write(data)
+
+def slurp(filename):
+    with open(filename, 'r') as f:
+        return f.read().strip()
 
 def fs_friendly(path):
     # return re.sub(r'[^a-zA-Z0-9_\-\.]', '_', path)
@@ -156,9 +160,9 @@ class Book:
         mkdir -p out
         #parallel --bar convert "{{}}" "pdf/{{.}}.pdf" ::: *.png
         #parallel --jobs 1 --bar convert -resize "50%" "{{}}" "pdf/{{.}}.pdf" ::: *.png
-        parallel --jobs 6 --bar gm convert -resize "50%" "{{}}" "pdf/{{.}}.pdf" ::: *.png
+        parallel --jobs 12 --bar gm convert -resize "50%" "{{}}" "pdf/{{.}}.pdf" ::: *.png
         pdftk pdf/*.pdf cat output out/out.pdf
-        ocrmypdf -l nor --jobs 6 --output-type pdfa out/out.pdf "../../{filename}"
+        ocrmypdf -l nor --jobs 12 --output-type pdfa out/out.pdf "../../{filename}"
 '''
         script = dedent(script).strip()
         spit(script, join(self.dir, 'convert.sh'))
@@ -191,6 +195,7 @@ def main():
     def downloader(url):
         headers = {}
         for h in args.header:
+            if isfile(h): h = slurp(h)
             k, v = h.split(':', 1)
             headers[k.strip()] = v.strip()
         return http_get_sync(url, headers)
