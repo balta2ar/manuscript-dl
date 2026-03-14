@@ -43,7 +43,7 @@ def http_get_sync(url, headers=None):
         for k, v in headers.items():
             req.add_header(k, v)
 
-    max_retries = 10
+    max_retries = 3
     for retry in range(max_retries):
         try:
             logging.info('sync HTTP GET %s (attempt %d/%d)', url, retry + 1, max_retries)
@@ -162,7 +162,7 @@ class Book:
         #parallel --jobs 1 --bar convert -resize "50%" "{{}}" "pdf/{{.}}.pdf" ::: *.png
         parallel --jobs 12 --bar gm convert -resize "50%" "{{}}" "pdf/{{.}}.pdf" ::: *.png
         pdftk pdf/*.pdf cat output out/out.pdf
-        ocrmypdf -l nor --jobs 12 --output-type pdfa out/out.pdf "../../{filename}"
+        env TMPDIR=/mnt/payload/tmp ocrmypdf -l nor --jobs 12 --output-type pdfa out/out.pdf "../../{filename}"
 '''
         script = dedent(script).strip()
         spit(script, join(self.dir, 'convert.sh'))
