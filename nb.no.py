@@ -72,9 +72,19 @@ def send_consent(id, headers=None):
     req.add_header("User-Agent", USER_AGENT)
     req.add_header("Accept", "application/json, text/plain, */*")
     req.add_header("Content-Length", "0")
+    authorization = None
     if headers:
+        cookie = next((v for k, v in headers.items() if k.lower() == "cookie"), None)
+        if cookie and not any(k.lower() == "authorization" for k in headers):
+            for part in cookie.split(";"):
+                key, sep, value = part.strip().partition("=")
+                if sep and key == "nbsso":
+                    authorization = value.strip()
+                    break
         for k, v in headers.items():
             req.add_header(k, v)
+    if authorization:
+        req.add_header("Authorization", authorization)
     try:
         logging.info("sending consent PUT %s", url)
         with urlopen(req) as resp:
