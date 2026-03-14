@@ -7,10 +7,10 @@ import re
 import time
 from collections import namedtuple
 from io import BytesIO
-from json import dumps, loads
+from json import dump, dumps, load, loads
 from multiprocessing.pool import ThreadPool
 from os import makedirs
-from os.path import dirname, exists, join, isfile
+from os.path import dirname, exists, expanduser, join, isfile
 from shutil import which
 from tempfile import gettempdir
 from textwrap import dedent
@@ -23,6 +23,8 @@ from plumbum import FG, local
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 FORMAT = "%(asctime)-15s %(levelname)s %(message)s"
+ITEM_API_BASE = "https://api.nb.no/catalog/v1/items"
+METADATA_CACHE_DIR = join(expanduser("~"), ".cache", "nb_cache")
 logging.basicConfig(format=FORMAT, level=logging.DEBUG)
 
 bash = local["bash"]
@@ -100,6 +102,84 @@ def suffix(s, suffix):
     if s.endswith(suffix):
         return s
     return s + suffix
+
+
+def metadata_cache_path(item_id):
+    return join(METADATA_CACHE_DIR, "{}.json".format(item_id))
+
+
+def read_metadata_cache(item_id):
+    path = metadata_cache_path(item_id)
+    if exists(path):
+        with open(path, "r") as f:
+            return load(f)
+    return None
+
+
+def write_metadata_cache(item_id, data):
+    path = ensure_dir(metadata_cache_path(item_id))
+    with open(path, "w") as f:
+        dump(data, f)
+
+
+def fetch_item_metadata(item_id, headers=None):
+    cached = read_metadata_cache(item_id)
+    if cached is not None:
+        return cached
+    url = "{}/{}".format(ITEM_API_BASE, item_id)
+    data = http_get_sync(url, headers)
+    if data is None:
+        return None
+    parsed = loads(data)
+    write_metadata_cache(item_id, parsed)
+    return parsed
+
+
+def clean_title(title):
+    title = re.sub(r"\s*:\s*", " - ", title)
+    title = re.sub(r"\s*;\s*", ", ", title)
+    title = re.sub(
+        r"""[<>"/\\|?*!'`\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f\u2039\u203a]""",
+        "",
+        title,
+    )
+    title = re.sub(r"\s+", " ", title)
+    return title.strip()
+
+
+def clean_author(author):
+    if not author:
+        return ""
+    parts = [p.strip() for p in author.split(",")]
+    if len(parts) == 2:
+        return "{} {}".format(parts[1], parts[0])
+    return author.strip()
+
+
+def build_filename(author, title, year):
+    parts = []
+    if author:
+        parts.append("{} - ".format(clean_author(author)))
+    parts.append(clean_title(title))
+    if year and year != "?":
+        parts.append(", {}".format(year))
+    return "".join(parts)
+
+
+def auto_filename(item_id, headers=None):
+    data = fetch_item_metadata(item_id, headers)
+    if not data:
+        return None
+    metadata = data.get("metadata", {})
+    title = metadata.get("title")
+    if not title:
+        return None
+    people = metadata.get("people", [])
+    primary = [p.get("name") for p in people if p.get("usage") == "primary"]
+    author = primary[0] if primary else ""
+    year = metadata.get("originInfo", {}).get("issued", "?")
+    filename = build_filename(author, title, year)
+    return filename or None
 
 
 def get_manifest(id, downloader):
@@ -248,21 +328,23 @@ def main():
 
     def parse_headers():
         headers = {}
-        for h in args.header:
+        for h in args.header or []:
             if isfile(h):
                 h = slurp(h)
             k, v = h.split(":", 1)
             headers[k.strip()] = v.strip()
         return headers
 
-    def downloader(url):
-        return http_get_sync(url, parse_headers())
+    headers = parse_headers()
 
-    send_consent(args.id, parse_headers())
+    def downloader(url):
+        return http_get_sync(url, headers)
+
+    send_consent(args.id, headers)
 
     book = Book(args.id, downloader)
     book.download()
-    book.convert(args.filename)
+    book.convert(args.filename or auto_filename(args.id, headers))
 
 
 if __name__ == "__main__":
