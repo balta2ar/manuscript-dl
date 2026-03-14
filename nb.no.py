@@ -324,7 +324,6 @@ def main():
     parser.add_argument("filename", nargs="?", default=None, help="Output filename")
     parser.add_argument("-H", "--header", help="HTTP header", action="append")
     args = parser.parse_args()
-    print(args)
 
     def parse_headers():
         headers = {}
@@ -334,8 +333,10 @@ def main():
             k, v = h.split(":", 1)
             headers[k.strip()] = v.strip()
         return headers
-
     headers = parse_headers()
+
+    args.filename = args.filename or auto_filename(args.id, headers)
+    print(args)
 
     def downloader(url):
         return http_get_sync(url, headers)
