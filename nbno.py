@@ -318,7 +318,7 @@ def main():
     must_bin('parallel')
     must_bin('gm')
 
-    # python ./nb.no.py -H 'header: value' URN:NBN:no-nb_digibok_2008091504048
+    # python ./nbno.py -H 'header: value' URN:NBN:no-nb_digibok_2008091504048
     parser = argparse.ArgumentParser("Download books from nb.no")
     parser.add_argument("id", help="Book ID")
     parser.add_argument("filename", nargs="?", default=None, help="Output filename")

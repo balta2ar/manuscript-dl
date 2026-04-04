@@ -13,7 +13,7 @@ To download a book:
 2. (optional) Copy curl command from the browser, so that you preserve cookies, and adjust it.
 3. Run:
 ```bash
-$ python ./nb.no.py -H 'cookie: something' URN:NBN:no-nb_digibok_2008091504048
+$ python ./nbno.py -H 'cookie: something' URN:NBN:no-nb_digibok_2008091504048
 ```
 
 #### [e-codices - Virtual Manuscript Library of Switzerland](http://www.e-codices.unifr.ch/en)
