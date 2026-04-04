@@ -25,12 +25,16 @@ BARE_ID_RE = re.compile(
 
 
 def resolve_line(line: str) -> str:
-    stripped = line.rstrip("\n")
+    stripped = line.rstrip("\r\n")
     m = BARE_ID_RE.match(stripped)
     if not m:
         return line
     prefix, book_id = m.group(1), m.group(2)
-    filename = nbno.auto_filename(book_id)
+    try:
+        filename = nbno.auto_filename(book_id)
+    except Exception as e:
+        sys.stderr.write(f"nb-resolve: error resolving {book_id}: {e}\n")
+        return line
     if not filename:
         sys.stderr.write(f"nb-resolve: could not resolve {book_id}\n")
         return line
