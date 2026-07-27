@@ -54,8 +54,10 @@ Per round, for each live file:
 
 Then:
 - **LSH bucket** all live files on their accumulated signatures. The LSH internal
-  threshold is set **looser** than `--sim` (e.g. 0.8) to over-include candidates
-  and avoid MinHash false-negatives dropping true dupes.
+  threshold is set **looser** than `--sim` (e.g. 0.7) to over-include candidates
+  and avoid MinHash false-negatives dropping true dupes. LSH is only a pruning
+  accelerator: a co-bucketed pair is kept as a candidate **only if it is also a
+  size-gated pair**, so LSH never introduces comparisons the size gate excluded.
 - **Discard gate (bucket-collision + upper-bound safety):** a file stays live if
   it shares an LSH bucket with ≥1 other file. If it is alone in all its buckets,
   it is discarded only if its optimistic upper bound to its best-ever
@@ -81,27 +83,44 @@ near-dup group. Singletons are dropped. Near-dup similarity is not perfectly
 transitive; if `(A,B)` and `(B,C)` confirm but `(A,C)` does not, union-find still
 groups all three — consistent with `dupfind`'s "keep oldest, print the rest".
 
-### 6. Output
-Per group, sort by `(mtime, path)`; retain the oldest, print the rest to stdout.
-With `-o`, print the retained original to stderr (green if TTY).
+Note this is a **second** union-find, over confirmed content edges, distinct from
+the size-gate component union-find in §6 that only schedules which files are
+compared.
+
+### 6. Output (streaming per component)
+Size-gated pairs are grouped into connected components (union-find over the gate
+graph). Each component is processed **independently and sequentially** — its
+progressive rounds run over only that component's gated pairs, then its confirmed
+groups are emitted before the next component starts. Because most components are
+small they finish quickly, so the first output appears within seconds rather than
+after the whole library is scanned (measured: ~3 s to first line vs ~117 s total
+on 1,933 PDFs).
+
+Per group, sort by `(mtime, path)`; retain the oldest, print the rest to stdout
+(flushed immediately). With `-o`, print the retained original to stderr (green if
+TTY).
 
 ## Structure
 
-Compact, composable functions with single responsibilities and clean interfaces
-(no incidental comments):
+Compact, composable, fully type-annotated functions (no incidental comments).
+All imports at module top; third-party libs without stubs carry inline
+`# ty: ignore[unresolved-import]`. Verified with `uv run --with ty ty check`.
 
 - `parse_size(str) -> int` — byte-size arg parser (`1M`, `512K`, plain int).
-- `stat_inputs(lines) -> list[Entry]` — ingest + stat, warn-and-skip.
-- `size_candidates(entries, size) -> pairs / neighbour index` — two-pointer gate.
-- `Chunker` — wraps `fastcdc`, yields the accumulated chunk set for a file given
-  a byte range; reusable for both progressive and exact passes.
-- `Signature` — thin wrapper over `datasketch.MinHash` (update, jaccard).
-- `upper_bound(matched, union, remaining_bytes, avg_chunk) -> float`.
-- `progressive_filter(entries, inc, sim) -> co_bucketed` — the round loop.
-- `confirm(co_bucketed, sim) -> edges` — exact Jaccard.
-- `group(edges) -> components` — union-find.
-- `report(groups, show_original)` — output, oldest-retained.
-- `main()` — wires stdin → gate → progressive → confirm → group → report.
+- `jaccard`, `upper_bound` — set-overlap and optimistic-bound helpers.
+- `chunkset(path, start, end) -> set[bytes]` — one-shot FastCDC chunk set.
+- `ChunkReader` — boundary-aligned incremental chunker; `advance(n)` returns
+  newly-completed chunk IDs, buffering the tail so accumulated advances equal
+  whole-file chunking exactly.
+- `DisjointSet` — union-find (path-halving), used for gate components and groups.
+- `size_pairs(sizes, rel) -> list[(i, j)]` — two-pointer per-pair gate.
+- `progressive_filter(pairs, inc, sim) -> gated survivors` — the round loop
+  (per-file `_Live` state: `ChunkReader` + MinHash + accumulated set).
+- `confirm(pairs, sim) -> edges` — exact Jaccard.
+- `cluster_groups(pairs, sim, inc) -> groups` — filter → confirm → union-find.
+- `iter_near_dups(paths, size, sim, inc) -> Iterator[group]` — gate, split into
+  components, yield each component's groups lazily.
+- `read_inputs`, `emit`, `main` — stdin ingest, per-group output, CLI wiring.
 
 ## Libraries
 
@@ -109,8 +128,9 @@ Compact, composable functions with single responsibilities and clean interfaces
 - `hashlib` (stdlib) — SHA-1 chunk IDs.
 - `datasketch` — `MinHash`, `MinHashLSH`.
 
-Parallelism across cores for per-round read + chunk. In-memory only; no disk
-cache.
+Distributed as a self-contained `uv` script (PEP 723 inline deps). In-memory
+only; no disk cache. Files are opened/read/closed per round, so peak file
+descriptors stay small regardless of cluster size.
 
 ## Validation (on the real target library)
 
