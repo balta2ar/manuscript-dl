@@ -1,0 +1,933 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "archive-pdf-tools>=1.5",
+#     "numpy",
+#     "pikepdf>=9",
+#     "pillow",
+#     "scikit-image",
+# ]
+# ///
+"""Repack a scanned PDF at a fraction of its size, keeping the text sharp.
+
+Pages are classified by content and each class is encoded with the codec that
+suits it: bitonal text goes to JBIG2, greyscale pictures to greyscale JPEG,
+and anything carrying colour to MRC (a JBIG2 text mask over a JPEG2000 colour
+background). The result is reassembled in page order and wrapped as PDF/A
+without re-encoding.
+
+See docs/superpowers/specs/2026-07-30-pdf-compression-implementation-spec.md
+for the measurements behind the defaults.
+
+External programs required: pdftoppm (poppler), tesseract, ocrmypdf,
+grk_compress (grok). recode_pdf is installed automatically as a dependency.
+"""
+from __future__ import annotations
+
+import re
+
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
+from concurrent.futures import ThreadPoolExecutor
+from os import cpu_count, environ, link
+from pathlib import Path
+from shutil import copy, rmtree, which
+from subprocess import CalledProcessError, SubprocessError, run
+from sys import executable, exit, stderr
+from tempfile import mkdtemp
+
+import numpy as np
+import pikepdf
+from PIL import Image
+from skimage.filters import threshold_otsu
+
+# ---------------------------------------------------------------- classifier
+
+CHROMA_LIMIT = 40      # per-pixel max-min RGB spread counted as "coloured"
+COLOUR_LIMIT = 0.002   # page-wide chromatic fraction promoting a page to colour
+BLOCK_LIMIT = 0.05     # chromatic fraction within any one tile, catches small art
+BLOCKS = 8             # page is divided into BLOCKS x BLOCKS tiles
+MIDTONE_LIMIT = 0.30   # midtone fraction above which a page holds pictures
+
+CLASSES = ('text', 'grey-picture', 'colour')
+
+
+def classify(path: Path) -> str:
+    """Decide how one page should be encoded.
+
+    Deliberately biased towards 'colour'. Misjudging text as colour costs
+    bytes; misjudging colour as text destroys information that cannot be
+    recovered. So a small but vivid illustration promotes the whole page even
+    though its share of the page area is tiny.
+    """
+    probe = Image.open(path)
+    probe.thumbnail((300, 300))
+
+    rgb = np.asarray(probe.convert('RGB'), dtype=np.int16)
+    chroma = (rgb.max(axis=2) - rgb.min(axis=2)) > CHROMA_LIMIT
+    if chroma.mean() >= COLOUR_LIMIT:
+        return 'colour'
+
+    h, w = chroma.shape
+    bh, bw = max(1, h // BLOCKS), max(1, w // BLOCKS)
+    for y in range(0, h - bh + 1, bh):
+        for x in range(0, w - bw + 1, bw):
+            if chroma[y:y + bh, x:x + bw].mean() >= BLOCK_LIMIT:
+                return 'colour'
+
+    grey = np.asarray(probe.convert('L'))
+    midtone = ((grey >= 60) & (grey <= 200)).mean()
+    return 'grey-picture' if midtone >= MIDTONE_LIMIT else 'text'
+
+
+# ------------------------------------------------------------------ helpers
+
+def sh(cmd, **kw):
+    """Run a command with _JAVA_OPTIONS removed.
+
+    That variable makes the JVM print a banner ahead of veraPDF's own output,
+    which defeats ocrmypdf's version probe. veraPDF then looks unavailable and
+    Ghostscript silently takes over the PDF/A conversion -- which cannot write
+    JBIG2 and downgrades it to CCITT, costing roughly 15%.
+    """
+    env = dict(environ)
+    env.pop('_JAVA_OPTIONS', None)
+    return run(cmd, env=env, check=True,
+                          capture_output=True, text=True, **kw)
+
+
+def require(*programs):
+    missing = [p for p in programs if which(p) is None]
+    if missing:
+        exit(f'error: required program(s) not found on PATH: '
+                 f'{", ".join(missing)}')
+
+
+def recode_pdf_bin() -> str:
+    """recode_pdf ships beside this script's interpreter in the uv venv."""
+    local = Path(executable).parent / 'recode_pdf'
+    return str(local) if local.exists() else 'recode_pdf'
+
+
+def log(msg, *, quiet=False):
+    if not quiet:
+        print(msg, file=stderr, flush=True)
+
+
+def _page_images(page):
+    """Yield (name, image) for a page, across pikepdf versions."""
+    getter = getattr(page, 'get_images', None)
+    if getter is not None:
+        try:
+            return list(getter().items())
+        except Exception:
+            pass
+    return list(page.images.items())
+
+
+# --------------------------------------------------------------- page input
+
+def native_dpi(src: Path, fallback: int, cap: int) -> int:
+    """Infer the resolution actually present in the source PDF.
+
+    Rendering above this invents pixels: the encoders then spend bytes on
+    upsampled detail that was never in the scan, and the output can end up
+    several times larger than the input. Rendering below it throws away real
+    detail. So measure it rather than guessing.
+    """
+    best = 0
+    with pikepdf.open(src) as pdf:
+        for page in pdf.pages:
+            box = page.MediaBox
+            width_in = (float(box[2]) - float(box[0])) / 72.0
+            if width_in <= 0:
+                continue
+            for _name, image in _page_images(page):
+                try:
+                    best = max(best, int(int(image.Width) / width_in))
+                except (AttributeError, ValueError, ZeroDivisionError):
+                    continue
+    if not best:
+        return fallback
+    return max(72, min(best, cap))
+
+
+def rasterise(src: Path, workdir: Path, dpi: int, jobs: int, quiet: bool) -> list[Path]:
+    """Render the input PDF to one PNG per page."""
+    imgs = workdir / 'imgs'
+    imgs.mkdir(parents=True, exist_ok=True)
+    log(f'rendering {src.name} at {dpi} dpi ...', quiet=quiet)
+    sh(['pdftoppm', '-r', str(dpi), '-png', str(src), str(imgs / 'page')])
+    pages = sorted(imgs.glob('page*.png'))
+    if not pages:
+        exit('error: no pages rendered from input')
+    # normalise to a strict 4-digit sequence, which recode_pdf globs in order
+    out = []
+    for n, p in enumerate(pages, 1):
+        dst = imgs / f'{n:04d}.png'
+        if p != dst:
+            p.rename(dst)
+        out.append(dst)
+    return out
+
+
+def collect_images(srcdir: Path, workdir: Path) -> list[Path]:
+    """Use an existing directory of page images."""
+    found = sorted(p for p in srcdir.iterdir()
+                   if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.tif', '.tiff'))
+    if not found:
+        exit(f'error: no page images found in {srcdir}')
+    imgs = workdir / 'imgs'
+    imgs.mkdir(parents=True, exist_ok=True)
+    out = []
+    for n, p in enumerate(found, 1):
+        dst = imgs / f'{n:04d}.png'
+        if p.suffix.lower() == '.png':
+            link(p, dst) if p.stat().st_dev == imgs.stat().st_dev else copy(p, dst)
+        else:
+            Image.open(p).save(dst)
+        out.append(dst)
+    return out
+
+
+# ------------------------------------------------------------------- the OCR
+
+HOCR_HEAD = (
+    "<?xml version='1.0' encoding='UTF-8'?>\n"
+    "<html xmlns='http://www.w3.org/1999/xhtml'><head><title></title>"
+    "<meta http-equiv='Content-Type' content='text/html;charset=utf-8'/>"
+    "<meta name='ocr-system' content='tesseract'/></head>\n<body>\n"
+)
+
+
+def ocr_pages(pages: list[Path], lang: str, jobs: int, quiet: bool) -> None:
+    """One OCR pass for the whole book; every encoder reuses this hOCR."""
+    log(f'running OCR on {len(pages)} pages ({lang}) ...', quiet=quiet)
+
+    def one(p: Path):
+        sh(['tesseract', str(p), str(p.with_suffix('')), '-l', lang, 'hocr'])
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        list(pool.map(one, pages))
+
+
+def page_div(hocr: Path, seq: int) -> str:
+    text = hocr.read_text(encoding='utf-8')
+    m = re.search(r"(<div class='ocr_page'.*?)(?=</body>)", text, re.S)
+    if not m:
+        return f"<div class='ocr_page' id='page_{seq}'></div>"
+    return re.sub(r"id='page_\d+'", f"id='page_{seq}'", m.group(1))
+
+
+def write_hocr(dest: Path, hocrs: list[Path], scale: float = 1.0) -> None:
+    divs = [page_div(h, i) for i, h in enumerate(hocrs, 1)]
+    body = HOCR_HEAD + '\n'.join(divs) + '\n</body>\n</html>\n'
+    body = propagate_font_size(body)
+    if scale != 1.0:
+        body = scale_hocr(body, scale)
+    dest.write_text(body, encoding='utf-8')
+
+
+# Line-level classes tesseract emits. It labels lines by layout role, so a
+# page may contain no 'ocr_line' at all.
+_LINE_CLASSES = 'ocr_line|ocr_caption|ocr_header|ocr_textfloat'
+_TOKEN = re.compile(
+    r"<span class='(?:" + _LINE_CLASSES + r")'[^>]*title=(?P<lq>[\"'])(?P<ltitle>.*?)(?P=lq)"
+    r"|<span class='ocrx_word'[^>]*title=(?P<wq>[\"'])(?P<wtitle>.*?)(?P=wq)",
+    re.S)
+_X_SIZE = re.compile(r'x_size\s+([\d.]+)')
+
+
+def propagate_font_size(body: str) -> str:
+    """Copy each line's x_size onto its words as x_fsize.
+
+    recode_pdf reads the font size from an ``x_fsize`` attribute on the *word*,
+    but tesseract only ever writes ``x_size`` on the *line*. Without this the
+    parser sees a font size of zero for every word, the line-height fallback is
+    degenerate too, and everything is drawn at the hardcoded 8 pt default. The
+    text layer then sits far too small to select, and viewers cannot group
+    words into lines, so copied text comes out one word per line in geometric
+    rather than reading order.
+    """
+    current = None
+
+    def sub(m):
+        nonlocal current
+        if m.group('ltitle') is not None:
+            found = _X_SIZE.search(m.group('ltitle'))
+            current = found.group(1) if found else None
+            return m.group(0)
+        if current is None or 'x_fsize' in m.group('wtitle'):
+            return m.group(0)
+        quote = m.group('wq')
+        return m.group(0)[:-len(m.group('wtitle')) - len(quote)] + \
+            f"{m.group('wtitle')}; x_fsize {current}{quote}"
+
+    return _TOKEN.sub(sub, body)
+
+
+_BBOX = re.compile(r'\bbbox (\d+) (\d+) (\d+) (\d+)')
+_BASELINE = re.compile(r'\bbaseline ([-\d.]+) ([-\d.]+)')
+
+
+def scale_hocr(body: str, scale: float) -> str:
+    """Rescale hOCR geometry from the OCR raster to the encoding raster.
+
+    OCR wants roughly 300 dpi to read small type; the encoder wants the
+    source's native resolution so it does not spend bytes on invented pixels.
+    Those are different rasters, so the coordinates have to be moved between
+    them or the text layer lands in the wrong place.
+    """
+    def bbox(m):
+        v = [int(round(int(g) * scale)) for g in m.groups()]
+        return f'bbox {v[0]} {v[1]} {v[2]} {v[3]}'
+
+    def baseline(m):
+        # first value is a slope and must not be scaled; second is an offset
+        return f'baseline {m.group(1)} {float(m.group(2)) * scale:.3f}'
+
+    return _BASELINE.sub(baseline, _BBOX.sub(bbox, body))
+
+
+# -------------------------------------------------------------- the encoders
+
+def mode_flags(kind: str, args) -> list[str]:
+    if kind == 'text':
+        return ['--bw-pdf']
+    if kind == 'grey-picture':
+        return ['--grayscale-pdf']
+    return ['--mrc-image-format', 'jpeg2000',
+            '-J', args.jp2_encoder,
+            '--bg-downsample', str(args.bg_downsample),
+            f'--bg-compression-flags=-r {args.rate}',
+            f'--hq-bg-compression-flags=-r {args.rate}']
+
+
+def downscale(pages: list[Path], workdir: Path, factor: float,
+              quiet: bool) -> list[Path]:
+    """Produce the encoding raster from the (higher resolution) OCR raster."""
+    if factor >= 1.0:
+        return pages
+    dest = workdir / 'enc'
+    dest.mkdir(parents=True, exist_ok=True)
+    log(f'downscaling to encoding resolution ({factor:.2f}x) ...', quiet=quiet)
+    out = []
+    for p in pages:
+        img = Image.open(p)
+        size = (max(1, round(img.width * factor)), max(1, round(img.height * factor)))
+        target = dest / p.name
+        img.resize(size, Image.LANCZOS).save(target)
+        out.append(target)
+    return out
+
+
+def encode_class(kind: str, pages: list[tuple[int, Path, Path]], workdir: Path,
+                 args, scale: float, quiet: bool) -> Path:
+    """Stage one class's images and hOCR, then recode them together."""
+    d = workdir / f'cls-{kind}'
+    (d / 'imgs').mkdir(parents=True, exist_ok=True)
+
+    hocrs = []
+    for seq, (_page_no, enc_img, ocr_img) in enumerate(pages, 1):
+        copy(enc_img, d / 'imgs' / f'{seq:04d}.png')
+        hocrs.append(ocr_img.with_suffix('.hocr'))
+    write_hocr(d / 'all.hocr', hocrs, scale)
+
+    out = workdir / f'{kind}.pdf'
+    cmd = [recode_pdf_bin(),
+           '-I', str(d / 'imgs' / '*.png'),
+           '-T', str(d / 'all.hocr'),
+           '-o', str(out),
+           '--dpi', str(args.dpi)] + mode_flags(kind, args)
+    log(f'  encoding {len(pages):4d} {kind:<13} pages ...', quiet=quiet)
+    try:
+        sh(cmd)
+    except CalledProcessError as e:
+        exit(f'error: recode_pdf failed for class {kind}:\n'
+                 f'{(e.stderr or e.stdout or "").strip()[-2000:]}')
+    return out
+
+
+def merge(parts: dict[str, tuple[Path, list[int]]], total: int,
+          dest: Path) -> None:
+    """Interleave the per-class PDFs back into original page order."""
+    where = {}
+    for kind, (_path, page_numbers) in parts.items():
+        for seq, page_no in enumerate(page_numbers):
+            where[page_no] = (kind, seq)
+
+    opened = {kind: pikepdf.open(path) for kind, (path, _) in parts.items()}
+    out = pikepdf.Pdf.new()
+    for page_no in range(1, total + 1):
+        kind, seq = where[page_no]
+        out.pages.append(opened[kind].pages[seq])
+    out.save(dest)
+    for pdf in opened.values():
+        pdf.close()
+
+
+# ------------------------------------------------------------------- PDF/A
+
+def to_pdfa(src: Path, dest: Path, lang: str, jobs: int, quiet: bool) -> bool:
+    """Wrap as PDF/A without re-encoding any image.
+
+    Relies on ocrmypdf's speculative path, which builds the PDF/A structures
+    with pikepdf and validates with veraPDF rather than invoking Ghostscript.
+    Ghostscript cannot write JBIG2 and would downgrade it to CCITT.
+    """
+    # recode_pdf writes its own output intent; ocrmypdf's speculative
+    # conversion adds a second with a different destination profile, which
+    # veraPDF rejects under PDF/A-2 clause 6.2.3. One failed rule is enough to
+    # fall back to Ghostscript, so drop any pre-existing intent first.
+    stripped = src.with_name('stripped.pdf')
+    with pikepdf.open(src) as pdf:
+        if '/OutputIntents' in pdf.Root:
+            del pdf.Root['/OutputIntents']
+        pdf.save(stripped)
+
+    log('wrapping as PDF/A ...', quiet=quiet)
+    try:
+        sh(['ocrmypdf', '--skip-text', '--output-type', 'pdfa',
+             '--optimize', '0', '-l', lang, '--jobs', str(jobs), '--quiet',
+             str(stripped), str(dest)])
+        return True
+    except CalledProcessError as e:
+        log(f'warning: PDF/A conversion failed, keeping plain PDF\n'
+            f'{(e.stderr or "").strip()[-500:]}', quiet=quiet)
+        copy(stripped, dest)
+        return False
+
+
+def check_encodings(path: Path, quiet: bool) -> None:
+    """Warn if the expected codecs did not survive.
+
+    The failure mode is silent: a valid but larger file with degraded images,
+    which is what happens when Ghostscript takes over the PDF/A step.
+    """
+    seen = set()
+    with pikepdf.open(path) as pdf:
+        for page in pdf.pages:
+            for _name, image in _page_images(page):
+                seen.add(str(image.get('/Filter')))
+    if any('CCITT' in f for f in seen):
+        log('warning: output contains CCITTFaxDecode images, which means '
+            'Ghostscript re-encoded the JBIG2 layer. Check that veraPDF is on '
+            'PATH and reports its version cleanly.', quiet=quiet)
+    log(f'  codecs in output: {", ".join(sorted(seen)) or "none"}', quiet=quiet)
+
+
+# ------------------------------------------------------------------- doctor
+
+# Each entry: what it is for, how to get its version, and how to install it.
+# Package names were taken from dpkg on a working Debian-family system rather
+# than guessed.
+BINARIES = [
+    ('pdftoppm', 'required', 'renders PDF pages to images',
+     ['-v'], 'apt install poppler-utils'),
+    ('tesseract', 'required', 'OCR, and the hOCR that positions the text layer',
+     ['--version'], 'apt install tesseract-ocr'),
+    ('ocrmypdf', 'required', 'PDF/A conversion',
+     ['--version'], "pip install --user 'ocrmypdf==17.7.1'"),
+    ('grk_compress', 'recommended', 'JPEG2000 encoder for MRC backgrounds',
+     ['--version'], 'apt install grokj2k  (without it, falls back to the '
+                    'slower pillow encoder: --jp2-encoder pillow)'),
+    ('verapdf', 'recommended', 'validates PDF/A so Ghostscript can be skipped',
+     ['--version'], 'https://verapdf.org/software/  (without it Ghostscript '
+                    'converts JBIG2 to CCITT and output grows ~15%)'),
+    ('gs', 'optional', 'Ghostscript, only used as a PDF/A fallback',
+     ['--version'], 'apt install ghostscript'),
+    ('jpegoptim', 'optional', 'only needed for --mrc-image-format jpeg',
+     ['--version'], 'apt install jpegoptim'),
+]
+
+MODULES = [
+    ('pikepdf', 'required', 'reads and writes PDF structure'),
+    ('PIL', 'required', 'image handling (pillow)'),
+    ('numpy', 'required', 'page classification'),
+    ('skimage', 'required', 'Otsu thresholding (scikit-image)'),
+    ('internetarchivepdf', 'required', 'provides recode_pdf (archive-pdf-tools)'),
+]
+
+# ocrmypdf's own dependencies. pip cannot supply the binaries, and the Python
+# ones live in ocrmypdf's interpreter rather than this script's uv environment,
+# so both are probed separately below.
+#
+# pdf-repack invokes ocrmypdf with --optimize 0 --skip-text, so the optimiser
+# and cleaning tools never run for us. They still matter if you call ocrmypdf
+# yourself, as nbno.py does.
+OCRMYPDF_BINARIES = [
+    ('jbig2', 'optional', 'ocrmypdf: lossless JBIG2 for monochrome images, '
+                          'at --optimize 1+ (unused by pdf-repack)',
+     'apt install jbig2, or build from https://github.com/agl/jbig2enc'),
+    ('pngquant', 'optional', 'ocrmypdf: quantises lossless images, '
+                             'only at --optimize 2+ (unused by pdf-repack)',
+     'apt install pngquant'),
+    ('unpaper', 'optional', 'ocrmypdf: enables --clean / --clean-final '
+                            '(unused by pdf-repack)',
+     'apt install unpaper'),
+]
+
+OCRMYPDF_MODULES = [
+    ('fpdf', 'required', 'ocrmypdf: renders the text layer (fpdf2 >= 2.8)',
+     'pip install fpdf2'),
+    ('uharfbuzz', 'required', 'ocrmypdf: shapes text for multilingual output',
+     'pip install uharfbuzz'),
+    ('pypdfium2', 'recommended', 'ocrmypdf: faster page rasterisation than '
+                                 'Ghostscript',
+     'pip install pypdfium2'),
+]
+
+_VERSION_NUM = re.compile(r'(\d+(?:\.\d+)+)')
+
+
+def _version_of(program: str, flags: list[str]) -> str | None:
+    try:
+        r = run([program] + flags, capture_output=True, text=True,
+                           timeout=30, env={**environ, '_JAVA_OPTIONS': ''})
+    except (OSError, SubprocessError):
+        return None
+    text = (r.stdout or '') + (r.stderr or '')
+    for line in text.splitlines():
+        m = _VERSION_NUM.search(line)
+        if m:
+            return m.group(1)
+    return text.strip().splitlines()[0][:40] if text.strip() else '?'
+
+
+def _ocrmypdf_python() -> str | None:
+    """Find the interpreter ocrmypdf runs under, from its shebang.
+
+    ocrmypdf is an external program with its own environment. Its Python
+    dependencies must be probed there, not in this script's uv environment,
+    where they are neither present nor relevant.
+    """
+    path = which('ocrmypdf')
+    if not path:
+        return None
+    try:
+        with open(path, 'rb') as fh:
+            first = fh.readline(400).decode('utf-8', 'replace')
+    except OSError:
+        return None
+    if first.startswith('#!'):
+        candidate = first[2:].strip().split()
+        if candidate and Path(candidate[0]).exists():
+            return candidate[0]
+    return None
+
+
+def _has_noto_fonts() -> bool | None:
+    """Noto covers scripts ocrmypdf's bundled Latin font does not."""
+    if not which('fc-list'):
+        return None
+    try:
+        r = run(['fc-list', ':', 'family'], capture_output=True, text=True, timeout=30)
+    except (OSError, SubprocessError):
+        return None
+    return 'noto' in (r.stdout or '').lower()
+
+
+def doctor(lang: str) -> int:
+    """Report on every external tool the pipeline depends on."""
+    mark = {'ok': 'ok  ', 'warn': 'WARN', 'fail': 'MISS'}
+    problems, warnings = [], []
+    print('pdf-repack doctor\n')
+    print('external programs')
+
+    for name, need, purpose, flags, install in BINARIES:
+        path = which(name)
+        if path:
+            print(f'  {mark["ok"]}  {name:<13} {(_version_of(name, flags) or "?"):<10} {purpose}')
+        else:
+            state = 'fail' if need == 'required' else 'warn'
+            print(f'  {mark[state]}  {name:<13} {"-":<10} {purpose}')
+            print(f'        needed for: {need};  install: {install}')
+            (problems if need == 'required' else warnings).append(name)
+
+    print('\npython packages (installed automatically by uv)')
+    for name, need, purpose in MODULES:
+        try:
+            mod = __import__(name)
+            version = getattr(mod, '__version__', None)
+            if version is None:
+                try:
+                    from importlib.metadata import version as _pkg_version
+                    dist = {'PIL': 'pillow', 'skimage': 'scikit-image',
+                            'internetarchivepdf': 'archive-pdf-tools'}.get(name, name)
+                    version = _pkg_version(dist)
+                except Exception:
+                    version = '?'
+        except ImportError:
+            print(f'  {mark["fail"]}  {name:<21} {"-":<10} {purpose}')
+            problems.append(name)
+            continue
+        print(f'  {mark["ok"]}  {name:<21} {str(version):<10} {purpose}')
+
+    print('\nocrmypdf toolchain (pip cannot supply these)')
+    for name, need, purpose, install in OCRMYPDF_BINARIES:
+        if which(name):
+            print(f'  {mark["ok"]}  {name:<13} {(_version_of(name, ["--version"]) or "?"):<10} {purpose}')
+        else:
+            print(f'  {mark["warn"]}  {name:<13} {"-":<10} {purpose}')
+            print(f'        {need};  install: {install}')
+            warnings.append(name)
+
+    interpreter = _ocrmypdf_python()
+    if interpreter is None:
+        print(f'  {mark["warn"]}  cannot locate ocrmypdf\'s interpreter; '
+              f'skipping its python dependency checks')
+    else:
+        for name, need, purpose, install in OCRMYPDF_MODULES:
+            dist = {'fpdf': 'fpdf2'}.get(name, name)
+            probe = run([interpreter, '-c',
+                         f'import {name};'
+                         f'v = getattr({name}, "__version__", None);'
+                         f'from importlib.metadata import version as V;'
+                         f'print(v or V("{dist}"))'],
+                        capture_output=True, text=True)
+            if probe.returncode == 0:
+                print(f'  {mark["ok"]}  {name:<13} '
+                      f'{probe.stdout.strip()[:10]:<10} {purpose}')
+            else:
+                state = 'fail' if need == 'required' else 'warn'
+                print(f'  {mark[state]}  {name:<13} {"-":<10} {purpose}')
+                print(f'        {need};  install: {install}')
+                (problems if need == 'required' else warnings).append(name)
+
+    noto = _has_noto_fonts()
+    if noto is False:
+        print(f'  {mark["warn"]}  fonts-noto    {"-":<10} ocrmypdf: glyphs for '
+              f'non-Latin scripts when highlighting text')
+        print('        recommended;  install: apt install fonts-noto')
+        warnings.append('fonts-noto')
+    elif noto:
+        print(f'  {mark["ok"]}  fonts-noto    {"present":<10} ocrmypdf: glyphs for '
+              f'non-Latin scripts when highlighting text')
+
+    print('\nchecks')
+    # recode_pdf must be reachable as an executable, not just importable
+    rp = recode_pdf_bin()
+    if which(rp) or Path(rp).exists():
+        print(f'  {mark["ok"]}  recode_pdf found at {rp}')
+    else:
+        print(f'  {mark["fail"]}  recode_pdf not executable; reinstall archive-pdf-tools')
+        problems.append('recode_pdf')
+
+    # OCR language data
+    if which('tesseract'):
+        try:
+            langs = run(['tesseract', '--list-langs'],
+                                   capture_output=True, text=True, timeout=30)
+            available = set(langs.stdout.split()) | set(langs.stderr.split())
+            if lang in available:
+                print(f'  {mark["ok"]}  tesseract language "{lang}" installed')
+            else:
+                print(f'  {mark["fail"]}  tesseract language "{lang}" missing;'
+                      f' install: apt install tesseract-ocr-{lang}')
+                problems.append(f'tesseract-{lang}')
+        except (OSError, SubprocessError):
+            pass
+
+    # ocrmypdf 17.8.0/17.8.1 crash on pikepdf >= 10 while converting to PDF/A
+    ocr_version = _version_of('ocrmypdf', ['--version']) if which('ocrmypdf') else None
+    if ocr_version in ('17.8.0', '17.8.1'):
+        print(f'  {mark["warn"]}  ocrmypdf {ocr_version} crashes on PDF/A with pikepdf 10 '
+              f"(AttributeError: values).\n"
+              f"        install: pip install --user 'ocrmypdf==17.7.1'")
+        warnings.append('ocrmypdf-version')
+    elif ocr_version:
+        print(f'  {mark["ok"]}  ocrmypdf {ocr_version} is not a known-broken release')
+
+    # veraPDF must be *detectable by ocrmypdf*, which is stricter than being on
+    # PATH: a JVM banner on stdout defeats its version probe.
+    # veraPDF must be *detectable by ocrmypdf*, which is stricter than being on
+    # PATH. ocrmypdf matches its output against r'veraPDF (\d+(\.\d+)*)', and a
+    # JVM banner printed ahead of that defeats the match. ocrmypdf is an
+    # external program here, not an import, so replicate the probe directly.
+    if which('verapdf'):
+        probe = re.compile(r'veraPDF (\d+(\.\d+)*)')
+
+        def probe_ok(env):
+            try:
+                r = run(['verapdf', '--version'], capture_output=True,
+                                   text=True, timeout=60, env=env)
+            except (OSError, SubprocessError):
+                return False
+            return bool(probe.search((r.stdout or '').splitlines()[0] if r.stdout else ''))
+
+        clean = {k: v for k, v in environ.items() if k != '_JAVA_OPTIONS'}
+        if probe_ok(clean):
+            print(f'  {mark["ok"]}  ocrmypdf can detect veraPDF, so Ghostscript is '
+                  f'skipped and JBIG2 survives')
+            if not probe_ok(dict(environ)):
+                print('        note: _JAVA_OPTIONS in your shell would break this; '
+                      'pdf-repack strips it for subprocesses')
+        else:
+            print(f'  {mark["warn"]}  veraPDF is on PATH but does not report its version '
+                  f'in a form ocrmypdf accepts,\n'
+                  f'        so Ghostscript will run, convert JBIG2 to CCITT and '
+                  f'grow the output ~15%')
+            warnings.append('verapdf-probe')
+    
+    print()
+    if problems:
+        print(f'{len(problems)} required item(s) missing: {", ".join(problems)}')
+    if warnings:
+        print(f'{len(warnings)} warning(s): {", ".join(warnings)}\n'
+              f'  pdf-repack still runs. See each line above for what is '
+              f'affected -- some of these only matter if you invoke ocrmypdf '
+              f'yourself.')
+    if not problems and not warnings:
+        print('all good')
+    return 1 if problems else 0
+
+
+# -------------------------------------------------------------------- driver
+
+METHODS = ('mrc', 'auto', 'bw', 'gray')
+
+METHOD_HELP = """\
+mrc    encode every page as MRC: a JBIG2 text mask over a JPEG2000 colour
+       background. Keeps text sharp and pictures intact, including colour,
+       on the same page. 2-3x smaller than the source. (default)
+auto   classify every page and encode each with the codec that suits it.
+       Smaller than mrc on text-heavy books, but the classifier cannot tell a
+       line-art illustration from a page of text -- both are black strokes on
+       white paper -- so it will occasionally binarise a picture and ruin it.
+       Use only on books you know are plain text.
+bw     encode every page bitonal. Smallest possible, but every photograph and
+       halftone is reduced to black and white.
+gray   encode every page greyscale. Discards colour entirely.
+"""
+
+
+def parse_args(argv=None):
+    p = ArgumentParser(
+        prog='pdf-repack',
+        description='Repack a scanned PDF at a fraction of its size, '
+                    'keeping the text sharp.',
+        epilog='Methods:\n' + METHOD_HELP,
+        formatter_class=RawDescriptionHelpFormatter)
+
+    p.add_argument('-i', '--input', type=Path, metavar='PATH',
+                   help='a PDF; a directory of PDFs, all of which are '
+                        'repacked (not recursive); or a directory of page '
+                        'images making up one book')
+    p.add_argument('-o', '--output', type=Path, metavar='PATH',
+                   help='output file, or an existing directory to write into '
+                        'when the input is a directory of PDFs '
+                        '(default: <input>.<method>.pdf beside the input)')
+    p.add_argument('-m', '--method', default='mrc', choices=METHODS,
+                   help='encoding strategy (default: mrc)')
+    p.add_argument('-f', '--force', action='store_true',
+                   help='repack even if the output file already exists; by '
+                        'default such inputs are skipped, so an interrupted '
+                        'batch can simply be re-run')
+
+    q = p.add_argument_group('quality')
+    q.add_argument('-r', '--rate', type=int, default=50, metavar='N',
+                   help='JPEG2000 compression ratio for MRC backgrounds. '
+                        'LOWER means better quality and bigger files. 50 is a '
+                        'good default. If pictures look too soft or lose fine '
+                        'detail, step down: 30 costs roughly 40%% more, 20 '
+                        'roughly 85%% more (measured across three scanned '
+                        'books). Going the other way degrades fast -- 100 was '
+                        'judged clearly too poor, and the library default of '
+                        '500 destroys photographic detail entirely '
+                        '(default: 50)')
+    q.add_argument('--bg-downsample', type=int, default=2, metavar='N',
+                   help='downsample factor for MRC background layers. Do not '
+                        'use 1: it produces files larger than the original '
+                        '(default: 2)')
+    q.add_argument('--dpi', default='auto', metavar='N|auto',
+                   help='resolution for rendering pages and for the output '
+                        'page size. "auto" measures the resolution actually '
+                        'present in the source, which avoids upsampling a '
+                        'low-resolution scan into a larger file (default: auto)')
+    q.add_argument('--max-dpi', type=int, default=600, metavar='N',
+                   help='upper bound applied when --dpi is auto (default: 600)')
+
+    o = p.add_argument_group('other')
+    o.add_argument('-l', '--lang', default='nor', metavar='LANG',
+                   help='tesseract language for the text layer (default: nor)')
+    o.add_argument('-j', '--jobs', type=int, default=cpu_count() or 4,
+                   metavar='N', help='parallel workers (default: all cores)')
+    o.add_argument('--jp2-encoder', default='grok',
+                   choices=('grok', 'kakadu', 'openjpeg', 'pillow'),
+                   help='JPEG2000 encoder for MRC (default: grok)')
+    o.add_argument('--no-pdfa', action='store_true',
+                   help='skip PDF/A conversion and emit a plain PDF')
+    o.add_argument('--keep-temp', action='store_true',
+                   help='keep the working directory for inspection')
+    o.add_argument('--doctor', action='store_true',
+                   help='check that every external tool and library is '
+                        'present, report versions, and say how to install '
+                        'whatever is missing')
+    o.add_argument('-q', '--quiet', action='store_true',
+                   help='suppress progress output')
+    return p.parse_args(argv)
+
+
+def default_output(src: Path, method: str, into: Path | None = None) -> Path:
+    stem = src.name[:-4] if src.suffix.lower() == '.pdf' else src.name
+    return (into or src.parent) / f'{stem}.{method}.pdf'
+
+
+def is_our_output(path: Path) -> bool:
+    """True for files this tool produced, e.g. 'Book, 1998.mrc.pdf'.
+
+    Without this a second run over a directory would repack its own output
+    into 'Book, 1998.mrc.mrc.pdf'.
+    """
+    if path.suffix.lower() != '.pdf':
+        return False
+    return Path(path.stem).suffix.lstrip('.') in METHODS
+
+
+def collect_pdfs(directory: Path, method: str) -> list[Path]:
+    """PDFs directly inside a directory, excluding our own output files."""
+    return sorted(p for p in directory.iterdir()
+                  if p.is_file() and p.suffix.lower() == '.pdf'
+                  and not is_our_output(p))
+
+
+def resolve_dpi(setting, src: Path, max_dpi: int, quiet: bool) -> int:
+    if setting != 'auto':
+        return setting
+    if src.is_dir():
+        return 300
+    dpi = native_dpi(src, 300, max_dpi)
+    log(f'source resolution measured at {dpi} dpi', quiet=quiet)
+    return dpi
+
+
+def process(args, src: Path, out_path: Path) -> None:
+    """Repack one book. Raises SystemExit or OSError on failure."""
+    quiet = args.quiet
+    args.dpi = resolve_dpi(args.dpi_setting, src, args.max_dpi, quiet)
+
+    workdir = Path(mkdtemp(prefix='pdf-repack.'))
+    try:
+        if src.is_dir():
+            ocr_pages_list = collect_images(src, workdir)
+        else:
+            ocr_pages_list = rasterise(src, workdir, args.dpi, args.jobs, quiet)
+        scale = 1.0
+
+        ocr_pages(ocr_pages_list, args.lang, args.jobs, quiet)
+        enc_pages = downscale(ocr_pages_list, workdir, scale, quiet)
+
+        if args.method == 'auto':
+            log('classifying pages ...', quiet=quiet)
+            kinds = [classify(p) for p in enc_pages]
+        else:
+            forced = {'mrc': 'colour', 'bw': 'text', 'gray': 'grey-picture'}
+            kinds = [forced[args.method]] * len(enc_pages)
+
+        groups: dict[str, list[tuple[int, Path, Path]]] = {}
+        for page_no, (kind, enc, ocr) in enumerate(
+                zip(kinds, enc_pages, ocr_pages_list), 1):
+            groups.setdefault(kind, []).append((page_no, enc, ocr))
+        log('  ' + '  '.join(f'{k}={len(groups.get(k, []))}' for k in CLASSES),
+            quiet=quiet)
+
+        parts = {}
+        for kind, members in groups.items():
+            path = encode_class(kind, members, workdir, args, scale, quiet)
+            parts[kind] = (path, [n for n, _e, _o in members])
+
+        merged = workdir / 'merged.pdf'
+        if len(parts) == 1:
+            copy(next(iter(parts.values()))[0], merged)
+        else:
+            log('merging pages back into order ...', quiet=quiet)
+            merge(parts, len(enc_pages), merged)
+
+        if args.no_pdfa:
+            copy(merged, out_path)
+        else:
+            to_pdfa(merged, out_path, args.lang, args.jobs, quiet)
+
+        check_encodings(out_path, quiet)
+
+        if src.is_file():
+            before, after = src.stat().st_size, out_path.stat().st_size
+            ratio = f'{before / after:.1f}x smaller' if after else 'n/a'
+            log(f'{out_path.name}: {before/1e6:.2f} MB -> {after/1e6:.2f} MB '
+                f'({ratio})', quiet=quiet)
+        else:
+            log(f'{out_path.name}: {out_path.stat().st_size/1e6:.2f} MB',
+                quiet=quiet)
+    finally:
+        if args.keep_temp:
+            log(f'working files kept in {workdir}', quiet=quiet)
+        else:
+            rmtree(workdir, ignore_errors=True)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    if args.doctor:
+        return doctor(args.lang)
+    if args.input is None:
+        exit('error: -i/--input is required (or use --doctor)')
+    if not args.input.exists():
+        exit(f'error: input not found: {args.input}')
+    if args.bg_downsample < 1:
+        exit('error: --bg-downsample must be at least 1')
+
+    if args.dpi == 'auto':
+        args.dpi_setting = 'auto'
+    else:
+        try:
+            args.dpi_setting = int(args.dpi)
+        except ValueError:
+            exit('error: --dpi must be an integer or "auto"')
+        if args.dpi_setting < 1:
+            exit('error: --dpi must be positive')
+
+    require('tesseract', 'ocrmypdf')
+
+    # A directory holding PDFs is a batch; one holding page images is a single
+    # book. Checking for PDFs first keeps both meanings usable.
+    batch = args.input.is_dir() and collect_pdfs(args.input, args.method)
+    if batch:
+        if args.output and not args.output.is_dir():
+            exit('error: with a directory of PDFs, -o must be an existing '
+                 'directory to write results into')
+        jobs = [(src, default_output(src, args.method, args.output))
+                for src in batch]
+    else:
+        jobs = [(args.input, args.output
+                 or default_output(args.input, args.method))]
+
+    if any(src.is_file() for src, _ in jobs):
+        require('pdftoppm')
+
+    done = skipped = failed = 0
+    for src, out_path in jobs:
+        if out_path.exists() and not args.force:
+            log(f'skip {src.name}: {out_path.name} exists (use --force)',
+                quiet=args.quiet)
+            skipped += 1
+            continue
+        if len(jobs) > 1:
+            log(f'\n=== {src.name}', quiet=args.quiet)
+        try:
+            process(args, src, out_path)
+            done += 1
+        except (SystemExit, OSError, CalledProcessError) as e:
+            # One bad book must not abandon the rest of the batch.
+            if len(jobs) == 1:
+                raise
+            log(f'FAILED {src.name}: {e}', quiet=False)
+            failed += 1
+
+    if len(jobs) > 1:
+        log(f'\n{done} repacked, {skipped} skipped, {failed} failed',
+            quiet=args.quiet)
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    exit(main())
