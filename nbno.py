@@ -186,6 +186,8 @@ def get_manifest(id, downloader):
     # https://api.nb.no/catalog/v1/iiif/URN:NBN:no-nb_digibok_2008091504048/manifest?profile=nbdigital
     url = "https://api.nb.no/catalog/v1/iiif/{}/manifest?profile=nbdigital".format(id)
     data = downloader(url)
+    if data is None:
+        raise Exception("Failed to fetch manifest for '{}' (got 404 — check that the ID is correct)".format(id))
     return loads(data)
 
 
@@ -295,7 +297,11 @@ class Book:
         #parallel --jobs 1 --bar convert -resize "50%" "{{}}" "pdf/{{.}}.pdf" ::: *.png
         parallel --jobs 12 --bar gm convert -resize "50%" "{{}}" "pdf/{{.}}.pdf" ::: *.png
         pdftk pdf/*.pdf cat output out/out.pdf
-        env TMPDIR=/mnt/payload/tmp ocrmypdf -l nor --jobs 12 --output-type pdfa out/out.pdf "../../{filename}"
+        #env TMPDIR=/mnt/payload/tmp ocrmypdf -l nor --jobs 12 --output-type pdfa out/out.pdf "../../{filename}"
+        # --pdfa-image-compression forces the Ghostscript path; without it, ocrmypdf 17.x
+        # uses verapdf to validate a speculative pikepdf-only PDF/A conversion and skips
+        # Ghostscript entirely, leaving the lossless Flate page images uncompressed (~20x larger).
+        env TMPDIR=/mnt/payload/tmp ocrmypdf -l nor --jobs 12 --output-type pdfa --pdfa-image-compression jpeg out/out.pdf "../../{filename}"
 """
         script = dedent(script).strip()
         spit(script, join(self.dir, "convert.sh"))
